@@ -5,11 +5,11 @@
 | **Status** | Draft (design proposal) |
 | **Target project** | [kubernetes-sigs/dra-driver-nvidia-gpu](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu) |
 | **Driver** | `gpu.nvidia.com` (GPU kubelet plugin) |
-| **Resource model** | **Partitionable devices (KEP-4815)** — SharedCounters per PF + vGPU partition devices with `consumesCounters` |
+| **Resource model** | **Partitionable devices (KEP-4815)** + **Device compatibility groups (KEP-5963)** |
 | **Primary consumers** | KubeVirt VMs (via DRA / `GPUsWithDRA`), future VM runtimes that consume MDEV/VFIO vGPU |
 | **Related work** | Dynamic MIG (same partitionable substrate), VFIO passthrough (`PassthroughSupport`), Device Metadata |
 | **Lifecycle reference** | `kubevirt-dynamic-gpu-device-plugin` (mdev/vdev create/destroy, SR-IOV, MIG-backed vGPU, bin packing) |
-| **Cluster prerequisite** | Kubernetes with `DRAPartitionableDevices` available (see version matrix below) |
+| **Cluster prerequisites** | `DRAPartitionableDevices` + **`DRADeviceCompatibilityGroups`** (see version matrix) |
 
 ---
 
@@ -34,18 +34,25 @@ The DRA Driver for NVIDIA GPUs already exposes three device kinds under one driv
 
 Without DRA vGPU support, KubeVirt multi-tenant GPU density still depends on the older **Device Plugin** path (`kubevirt-dynamic-gpu-device-plugin`), while full-GPU passthrough and Dynamic MIG are moving to this DRA driver.
 
-### Why partitionable devices
+### Why partitionable devices + compatibility groups
 
-A single PF can typically host **exactly one vGPU profile family at a time**, with `maxInstances` slots, and optionally **MIG-backed** placements. Those layouts **overlap**: advertising both `12Q×4` and `24Q×2` without a shared budget lets the scheduler double-book the PF.
+A single PF can host **multiple slots of one partitioning scheme**, with layouts that **overlap** on hardware budget (FB, instances, MIG slices). Two distinct problems:
 
-That is the same problem **Dynamic MIG** already solves with **KEP-4815 partitionable devices**:
+| Problem | Example | API |
+| --- | --- | --- |
+| **Capacity / placement overlap** | two partitions need more FB/SMs than the PF has | **KEP-4815** SharedCounters + `consumesCounters` |
+| **Scheme / family mutual exclusion** | MIG and vGPU cannot both be active; often only one vGPU profile family at a time | **KEP-5963** `compatibilityGroups` on each `consumesCounters[]` entry |
+
+Counters alone cannot express “the **first** device from family A locks the PF to family A, but later family-A devices still consume counters normally.” A capacity-1 token counter would incorrectly charge **every** device. [KEP-5963](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/5963-device-compatibility-groups) exists for that gap (MIG ↔ vGPU is the KEP’s motivating story; see also [enhancements#5964](https://github.com/kubernetes/enhancements/pull/5964), [kubernetes#139795](https://github.com/kubernetes/kubernetes/pull/139795)).
+
+Combined flow:
 
 1. Publish a **CounterSet per PF** (framebuffer, instance slots, MIG memory slices, …).
-2. Advertise every **possible vGPU partition** as a device with `consumesCounters`.
-3. Scheduler allocates only combinations that fit remaining counters.
+2. Advertise every **possible partition** as a device with `consumesCounters` **and** `compatibilityGroups`.
+3. Scheduler allows co-allocation on a counter set only if **capacity fits** **and** group lists **intersect** (or all have no groups).
 4. **NodePrepare** creates the concrete mdev/vdev (and MIG GI/CI if required).
 
-Adopting the same substrate keeps one mental model for “carve the GPU,” reuses `partitions.go` / ResourceSlice publishing patterns, and gives correct multi-profile packing **before** bind—without reimplementing device-plugin `GetPreferredAllocation`.
+This matches Dynamic MIG’s publish path, adds the missing exclusivity predicate, and moves failure from prepare-time to **schedule-time**.
 
 ---
 
@@ -56,11 +63,12 @@ Adopting the same substrate keeps one mental model for “carve the GPU,” reus
 3. Allow optional opaque **`VgpuDeviceConfig`** for Prepare-time knobs (params, typeID overrides); profile **identity is primarily carried by the allocated partition device**.
 4. On **NodePrepareResources**, create the concrete vGPU (mdev and/or vendor-VFIO path), optional MIG GI/CI, CDI + Device Metadata for KubeVirt.
 5. On **NodeUnprepareResources**, destroy vGPU (then MIG if owned), update checkpoint; counters naturally free as claims release.
-6. Express **exclusivity** with full `gpu` and `vfio` siblings by having those devices **consume the entire PF CounterSet** (preferred) and/or sibling republish fallback.
-7. Achieve **bin packing / multi-profile safety in the scheduler** via counters—not post-hoc preferred allocation.
-8. Feature gate **`VGPUSupport`** (Alpha, default false); require cluster **`DRAPartitionableDevices`** (document version matrix).
-9. Align implementation with Dynamic MIG publishing (separate counters vs devices slices on k8s ≥ 1.35).
-10. Docs, demos, e2e on real vGPU Manager hardware.
+6. Express **mode exclusivity** with **KEP-5963 compatibility groups** (vGPU profile families, MIG vs vGPU, optional gpu/vfio mode tags) so the scheduler rejects incompatible co-allocation before Prepare.
+7. Use **full CounterSet consumption** for whole-PF `gpu` / `vfio` as the capacity backstop (complements groups).
+8. Achieve **bin packing** via counters and **family safety** via groups—not prepare-time hide/show as the primary mechanism.
+9. Feature gate **`VGPUSupport`** (Alpha, default false); require cluster **`DRAPartitionableDevices`** and **`DRADeviceCompatibilityGroups`** (document matrix + driver gate detection).
+10. Align implementation with Dynamic MIG publishing (KEP-4815 slices) and publish `compatibilityGroups` when the cluster gate is on.
+11. Docs, demos, e2e on real vGPU Manager hardware (including MIG↔vGPU rejection at schedule time).
 
 ## 3. Non-goals (initial releases)
 
@@ -81,12 +89,13 @@ Adopting the same substrate keeps one mental model for “carve the GPU,” reus
 | ID | Use case | Partitionable role |
 | --- | --- | --- |
 | UC-1 | Multi-instance vGPU for KubeVirt | N slot devices per profile; each consumes instance + FB counters |
-| UC-2 | Coexist with VFIO / full GPU | `gpu` / `vfio` devices consume **all** PF counters → exclusive |
+| UC-2 | Coexist with VFIO / full GPU | Full-counter consume + compatibility groups (`gpu` / `vfio` vs `vgpu`) |
 | UC-3 | mdev framework | Prepare creates mdev for allocated partition |
 | UC-4 | vdev framework | Prepare sets VF `current_vgpu_type` for allocated partition |
-| UC-5 | Crash-safe lifecycle | Checkpoint concrete ids; counters driven by claim allocation |
+| UC-5 | Crash-safe lifecycle | Checkpoint concrete ids; counters + claim group snapshot from scheduler |
 | UC-6 | KubeVirt attachment | CDI + DeviceMetadata from Prepare |
-| UC-7 | Multi-profile on one PF | Overlapping partition devices; counters prevent invalid mixes |
+| UC-7 | Multi-profile on one PF | Same-family slots share a group; different families use disjoint groups |
+| UC-7b | MIG vs vGPU on same PF | Container MIG and vGPU partitions use disjoint groups (KEP-5963 story) |
 
 ### 4.2 Secondary (should)
 
@@ -113,7 +122,8 @@ Adopting the same substrate keeps one mental model for “carve the GPU,” reus
 | --- | --- | --- |
 | FR-1 | Publish **SharedCounters** (one CounterSet per vGPU-capable PF) in the node resource pool. | P0 |
 | FR-2 | Publish **vGPU partition devices** (`type=vgpu`) each with `consumesCounters` against that PF CounterSet. | P0 |
-| FR-3 | Optionally publish `gpu` / `vfio` devices that consume the **full** CounterSet for exclusivity (when those features enabled). | P0 |
+| FR-3 | On each vGPU (and related) `consumesCounters[]` entry, publish **`compatibilityGroups`** per KEP-5963 for scheme/family exclusivity at schedule time. | P0 |
+| FR-3b | When `gpu` / `vfio` siblings are advertised on the same CounterSet, they consume the **full** set **and** carry disjoint groups from active vGPU/MIG families. | P0 |
 | FR-4 | Use pool layout compatible with KEP-4815: on k8s ≥ 1.35, **separate** ResourceSlices for counters vs devices (reuse Dynamic MIG publisher). | P0 |
 | FR-5 | DeviceClass `vgpu.gpu.nvidia.com` selects `type == vgpu`. | P0 |
 | FR-6 | Opaque `VgpuDeviceConfig` supported and webhook-validated (optional profile override / params); identity defaults from allocated device attrs. | P0 |
@@ -122,11 +132,11 @@ Adopting the same substrate keeps one mental model for “carve the GPU,” reus
 | FR-9 | CDI + DeviceMetadata for KubeVirt. | P0 |
 | FR-10 | Checkpoint `PreparedVgpuDevice` (mdev UUID or VF PCI, profile, optional MIG GI id). | P0 |
 | FR-11 | Feature gate `VGPUSupport` (Alpha, default false). | P0 |
-| FR-12 | Fail fast / clear errors if cluster lacks partitionable-device support when gate on. | P0 |
-| FR-13 | MIG-backed partitions: consume GI placement counters; Prepare = CreateMigInstance then vGPU (atomic). | P1 |
-| FR-14 | SR-IOV enable/slice in Prepare when needed; unsliced PF required for whole-PF VFIO (existing check). | P1 |
+| FR-12 | Fail fast if cluster lacks `DRAPartitionableDevices`; detect `DRADeviceCompatibilityGroups` and **omit or include** `compatibilityGroups` per skew rules (§6.1.1). | P0 |
+| FR-13 | MIG-backed vGPU partitions: GI placement counters + groups consistent with container MIG devices on the same PF. | P1 |
+| FR-14 | SR-IOV: admin pre-slice for Alpha; optional later DynamicSRIOV. Passthrough still requires unsliced PF. | P1 |
 | FR-15 | Metrics for prepare/unprepare and active partitions per PF. | P2 |
-| FR-16 | Helm DeviceClass, demos, site docs (concept + KubeVirt guide + ResourceSlice attributes). | P0 |
+| FR-16 | Helm DeviceClass, demos, site docs (concept + KubeVirt guide + ResourceSlice attributes + compatibility groups). | P0 |
 
 ### 5.2 Non-functional
 
@@ -136,6 +146,7 @@ Adopting the same substrate keeps one mental model for “carve the GPU,” reus
 | NFR-2 | `VGPUSupport=false` → no vGPU partitions/counters; no regression to gpu/mig/vfio. |
 | NFR-3 | API additive (`resource.nvidia.com/v1beta1`). |
 | NFR-4 | Counter model must match vGPU Manager rules (wrong counters ⇒ scheduler oversubscribe). |
+| NFR-4b | Compatibility group labels must match real co-existence rules (wrong groups ⇒ bad packs or false blocking). |
 | NFR-5 | Bound ResourceSlice size (profile × slots × GPUs); document scaling limits / aggregation strategies. |
 | NFR-6 | Checkpoint JSON: new fields `omitempty` (schema stability). |
 
@@ -144,7 +155,7 @@ Adopting the same substrate keeps one mental model for “carve the GPU,” reus
 | ID | Requirement |
 | --- | --- |
 | CR-1 | Host **vGPU Manager** (KVM); PFs on `nvidia` with supported types. |
-| CR-2 | Kubernetes with DRA + **`DRAPartitionableDevices`** (see §6.1.1 version matrix). |
+| CR-2 | Kubernetes with DRA + **`DRAPartitionableDevices`** + **`DRADeviceCompatibilityGroups`** (see §6.1.1). |
 | CR-3 | KubeVirt with `GPUsWithDRA` (+ agreed metadata for mdev/vdev). |
 | CR-4 | IOMMU as required by vdev/VFIO path. |
 | CR-5 | No classic GPU DP on same GPUs. |
@@ -163,6 +174,7 @@ Pod / VMI
   → ResourceClaim (DeviceClass vgpu.gpu.nvidia.com ± VgpuDeviceConfig)
   → webhook validate
   → scheduler selects a vGPU partition device whose consumesCounters fit SharedCounters
+       **and** compatibilityGroups intersect existing allocations on that CounterSet
   → kubelet NodePrepareResources
        → create MIG GI/CI if partition is MIG-backed
        → create mdev OR set VF vGPU type
@@ -175,8 +187,8 @@ Pod / VMI
 | --- | --- |
 | `api/.../v1beta1` | `VgpuDeviceConfig` |
 | `pkg/featuregates` | `VGPUSupport` (+ validation vs other gates) |
-| `cmd/gpu-kubelet-plugin/partitions.go` (or sibling) | vGPU CounterSet + `consumesCounters` helpers |
-| `driver.go` | Include vGPU counter sets + partition devices in KEP-4815 publish path |
+| `cmd/gpu-kubelet-plugin/partitions.go` (or sibling) | vGPU CounterSet + `consumesCounters` + **`compatibilityGroups`** |
+| `driver.go` | Include vGPU counter sets + partition devices in KEP-4815 publish path; set/strip groups from cluster gate |
 | `deviceinfo.go` / new `vgpu*.go` | `VgpuPartitionInfo`, discovery, host ops |
 | `device_state.go` | Prepare/Unprepare / applyConfig |
 | CDI | `vgpu-cdi.go` |
@@ -184,16 +196,24 @@ Pod / VMI
 
 ### 6.1.1 Cluster version matrix
 
-| Kubernetes | Partitionable devices | Driver publish mode |
-| --- | --- | --- |
-| 1.34–1.35 | Enable `DRAPartitionableDevices` on apiserver + scheduler | Follow existing Dynamic MIG branch (combined vs split slices) |
-| ≥ 1.36 | Typically default/beta per upstream | **Separate** ResourceSlices: counters vs devices (driver already detects ≥ 1.35) |
+| Kubernetes | Partitionable devices | Compatibility groups | Driver publish mode |
+| --- | --- | --- | --- |
+| 1.34–1.35 | Enable `DRAPartitionableDevices` | Typically unavailable | Counters+devices only; family exclusivity via prepare fallback |
+| ≥ 1.36 | Typically default/beta | — | Split ResourceSlices (existing driver logic) |
+| ≥ 1.37 (typical Alpha for groups) | On | Enable **`DRADeviceCompatibilityGroups`** (default off) on apiserver + scheduler | Publish `compatibilityGroups` when that gate is on |
 
-`VGPUSupport` MUST document and ideally **detect** missing scheduler support (fail plugin start or mark unhealthy with explicit log/metric).
+**Driver skew rules (normative):**
+
+1. If `DRAPartitionableDevices` is unavailable → do not enable vGPU publish; fail clearly.
+2. If `DRADeviceCompatibilityGroups` is **disabled**: **do not** set `compatibilityGroups` on slice devices. When the gate is off, Alpha kube-scheduler **ignores devices that declare groups** (KEP-5963 version-skew safety). Publishing groups with the gate off would hide vGPU capacity.
+3. If the gate is **enabled**: set groups on every `consumesCounters[]` entry that shares a PF CounterSet among vGPU / MIG / gpu / vfio siblings (see §6.2.3).
+4. Detect gate state at runtime when possible and republish slices if it flips.
+
+`VGPUSupport` docs MUST list both cluster gates.
 
 ### 6.2 Resource model (decision: partitionable devices only)
 
-**Decision:** vGPU support is built **only** on KEP-4815 partitionable devices. A simplified “single device + capacity” model is **not** the product path (may exist only as a rejected alternative in appendix).
+**Decision:** vGPU support is built on **KEP-4815 partitionable devices** plus **KEP-5963 compatibility groups** for scheme/family exclusivity. A simplified “single device + capacity” model is **not** the product path (appendix). Capacity-1 “family token” counters are **rejected**.
 
 #### 6.2.1 CounterSet per physical GPU
 
@@ -217,12 +237,11 @@ For each vGPU-capable PF, publish one CounterSet named consistently with Dynamic
 **Counter accounting rules (normative for Alpha):**
 
 1. Every vGPU partition device consumes `framebuffer` equal to that profile’s FB requirement and `vgpuInstances: 1` (unless profile defines otherwise).
-2. Full `gpu` and `vfio` devices for the same PF, when advertised, consume **100%** of the CounterSet (exclusive with any vGPU partition).
-3. If hardware allows only **one profile family** at a time, either:
-   - **(Preferred)** encode family exclusivity purely in counters (e.g. additional mutually exclusive counters / profile-group tokens), **or**
-   - **(Fallback)** prepare-time reject + republish dropping incompatible partitions when first profile locks (document as transitional if counters alone cannot express vendor rules).
+2. Full `gpu` and `vfio` devices for the same PF, when advertised, consume **100%** of the CounterSet (capacity-exclusive with any partial partition).
+3. **Do not** invent capacity-1 “family token” counters for mutual exclusion of schemes/families — that charges every device incorrectly. Use **`compatibilityGroups` (KEP-5963)** instead (see §6.2.3).
+4. Prepare-time reject remains a **safety net** for host drift / gate-off clusters, not the primary exclusivity mechanism when groups are available.
 
-> Implementing accurate FB and exclusivity is the hard product requirement; incorrect counters are considered defects.
+> Accurate FB counter costs **and** correct group labels are both product requirements. Wrong counters oversubscribe capacity; wrong/missing groups allow MIG+vGPU or cross-family packs that fail at Prepare.
 
 #### 6.2.2 Partition devices
 
@@ -255,7 +274,81 @@ Each device sets `consumesCounters` → parent `gpu-<minor>-counter-set`.
 
 **Do not** put live mdev UUIDs or VF PCIs in the advertised device **name**. Those appear only after Prepare in checkpoint/CDI/metadata.
 
-#### 6.2.3 Example ResourceSlices (non-MIG, one L40S)
+#### 6.2.3 Device compatibility groups (KEP-5963)
+
+**References:** [KEP-5963](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/5963-device-compatibility-groups), [enhancements#5964](https://github.com/kubernetes/enhancements/pull/5964), [kubernetes#139795](https://github.com/kubernetes/kubernetes/pull/139795), [DRA features — Device compatibility groups](https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/dra-features/#device-compatibility-groups).
+
+##### Problem groups solve (for this driver)
+
+SharedCounters ensure `Σ consumes ≤ budget`. They do **not** encode:
+
+- "MIG partitions and vGPU partitions cannot both be live on this PF"
+- "Only one vGPU profile family at a time (12Q slots may coexist with each other, not with 24Q)"
+- "Container full-GPU mode vs vGPU mode"
+
+Those are **co-allocation predicates** on top of capacity. Without groups, the scheduler can bind a MIG claim and a vGPU claim that both fit counters and node Prepare fails (KEP Story 1).
+
+##### API shape (driver-authored)
+
+On **each** `device.consumesCounters[]` entry (feature gate `DRADeviceCompatibilityGroups`):
+
+```text
+compatibilityGroups: []string   # max 2 opaque names per entry; unique within entry
+```
+
+Scheduler rule for two devices drawing from the **same** CounterSet:
+
+| Device A groups | Device B groups | Co-allocate? |
+| --- | --- | --- |
+| Share ≥1 name | intersection non-empty | **Yes** (if counters also fit) |
+| `{mig}` vs `{vgpu-12q}` | empty intersection | **No** |
+| unset / nil / `[]` ("no groups") | only other no-group devices | **Yes** with no-group only; **never** with grouped devices |
+| different CounterSets | not compared | N/A |
+
+Scheduler **snapshots** groups onto `ResourceClaim.status.allocation` per counter set at bind time so later claims evaluate against allocation-time groups, not a mutated slice. Drivers do **not** write claim status.
+
+##### Group naming plan for `gpu.nvidia.com` (normative proposal)
+
+Groups are **opaque** to Kubernetes; convention for this driver only:
+
+| Device kind | `compatibilityGroups` on PF CounterSet | Rationale |
+| --- | --- | --- |
+| Non-MIG vGPU slots of one exclusive family | `["vgpu-<profileSlug>"]` e.g. `["vgpu-12q"]` | Same family packs; other families blocked |
+| If multiple families may legally mix (rare) | shared super-group e.g. `["vgpu"]` on all | Document carefully |
+| Container Dynamic/static MIG partition | `["mig"]` | Disjoint from vGPU families |
+| MIG-**backed** vGPU partition | `["vgpu-mig"]` or `["vgpu-mig-<slug>"]` | Disjoint from pure `mig` and pure time-sliced `vgpu-*` unless hardware allows |
+| Full `gpu` (exclusive whole PF) | `["gpu-full"]` | Plus 100% counter consume |
+| `vfio` whole-PF passthrough | `["vfio"]` | Disjoint from vgpu/mig/gpu-full |
+
+**Alpha default:** allowlist usually publishes one family → all slots use one group (`vgpu` or `vgpu-<slug>`). Multi-family allowlists use **per-slug groups**.
+
+**Do not** put both `mig` and `vgpu` on the same device entry. Prefer **exactly one** group name per entry in Alpha (KEP allows at most 2).
+
+##### Example matrix
+
+| Already allocated | Still OK | Rejected by groups (even if FB fits) |
+| --- | --- | --- |
+| `vgpu-…-12q-0` (`vgpu-12q`) | other `vgpu-12q-*` | `vgpu-24q-*`, `mig`, `gpu-full`, `vfio` |
+| container `mig` device | other `mig` on remaining counters | any `vgpu-*` |
+| `gpu-vfio-0` | nothing else on this CounterSet | — |
+
+##### Driver implementation checklist
+
+1. When building each `DeviceCounterConsumption`, set `CompatibilityGroups` from partition kind + profile slug.
+2. If `DRADeviceCompatibilityGroups` is off, **strip** the field before publish (critical skew rule).
+3. Keep prepare-time validation as defense in depth (foreign mdev, gate skew, host MIG mode).
+4. Claims stay DeviceClass + CEL profile selectors only — no claim-side groups.
+5. Unit-test intersection matrices (same family pack, cross-family block, mig vs vgpu block).
+
+##### Relation to prior "profile family lock"
+
+| Old design idea | Replacement |
+| --- | --- |
+| Capacity-1 family token counter | **Rejected** — wrong accounting |
+| Prepare-time lock + republish drop other profiles | **Fallback only** when groups gate off |
+| Hide siblings after first allocate | Optional UX; not required if groups + full consume work |
+
+#### 6.2.4 Example ResourceSlices (non-MIG, one L40S)
 
 **Counters slice:**
 
@@ -305,6 +398,7 @@ spec:
       counters:
         framebuffer: { value: 48Gi }
         vgpuInstances: { value: "8" }
+      compatibilityGroups: ["gpu-full"]
 
   # Exclusive VFIO sibling (if PassthroughSupport)
   - name: gpu-vfio-0
@@ -317,8 +411,9 @@ spec:
       counters:
         framebuffer: { value: 48Gi }
         vgpuInstances: { value: "8" }
+      compatibilityGroups: ["vfio"]
 
-  # vGPU partitions — profile 12Q, 4 slots
+  # vGPU partitions — profile 12Q, 4 slots (group vgpu-12q)
   - name: vgpu-gpu-0-12q-0
     attributes:
       type: { string: vgpu }
@@ -335,6 +430,7 @@ spec:
       counters:
         framebuffer: { value: 12Gi }
         vgpuInstances: { value: "1" }
+      compatibilityGroups: ["vgpu-12q"]
 
   - name: vgpu-gpu-0-12q-1
     attributes: { type: { string: vgpu }, profile: { string: "NVIDIA L40S-12Q" }, slot: { int: 1 }, ... }
@@ -343,9 +439,10 @@ spec:
       counters:
         framebuffer: { value: 12Gi }
         vgpuInstances: { value: "1" }
+      compatibilityGroups: ["vgpu-12q"]
   # ... 12q-2, 12q-3 ...
 
-  # Overlapping alternate profile 24Q (2 slots)
+  # Alternate profile 24Q — disjoint group from 12Q
   - name: vgpu-gpu-0-24q-0
     attributes:
       type: { string: vgpu }
@@ -359,19 +456,20 @@ spec:
       counters:
         framebuffer: { value: 24Gi }
         vgpuInstances: { value: "1" }
+      compatibilityGroups: ["vgpu-24q"]
   # ... 24q-1 ...
 ```
 
-Scheduler examples:
+Scheduler examples (**counters + groups**):
 
-| Allocation | Remaining (conceptually) | Blocked |
+| Already allocated | Still OK | Rejected |
 | --- | --- | --- |
-| `vgpu-gpu-0-12q-0` | FB 36Gi, inst 7 | none that need >36Gi FB on this set |
-| four `12q-*` | FB 0 if 12×4=48 | further vGPU; full gpu/vfio |
-| two `24q-*` | FB 0 | further vGPU; full gpu/vfio |
-| `gpu-0` or `gpu-vfio-0` | 0 | all vGPU on PF |
+| nothing | any 12Q, 24Q, gpu-full, vfio (individually) | — |
+| one `12q-0` | other `12q-*` while FB/instances remain | `24q-*` (groups), `gpu-full`, `vfio`, `mig` |
+| two `24q-*` exhausting FB | nothing else on PF | — |
+| `gpu-0` / `gpu-vfio-0` | nothing else on PF | all partitions |
 
-#### 6.2.4 MIG-backed partition example
+#### 6.2.5 MIG-backed partition example
 
 Reuse Dynamic MIG counter dimensions; device type remains `vgpu`:
 
@@ -392,11 +490,12 @@ Reuse Dynamic MIG counter dimensions; device type remains `vgpu`:
       memory: { value: 5Gi }
       multiprocessors: { value: "14" }
       memorySlice0: { value: "1" }
+    compatibilityGroups: ["vgpu-mig"]   # disjoint from container type=mig ["mig"]
 ```
 
 Prepare: `CreateMigInstance` (GI+CI) → create mdev/vdev → verify MIG instance id (vdev path) → checkpoint both.
 
-#### 6.2.5 DeviceClass
+#### 6.2.6 DeviceClass
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -701,22 +800,29 @@ Partial failure: rollback mdev/vdev and MIG GI created by this attempt (Dynamic 
 
 ### 6.7 Exclusivity strategy
 
-| Mechanism | Role |
-| --- | --- |
-| **Primary:** full CounterSet consumption by `gpu` / `vfio` | Scheduler never dual-allocates PF modes |
-| **Secondary:** prepare-time checks | Host state drift, foreign mdevs |
-| **Tertiary:** sibling remove/republish | Optional UX; less critical than today if counters correct |
+Layered model:
+
+| Layer | Mechanism | Enforced when |
+| --- | --- | --- |
+| **L1 (preferred)** | **`compatibilityGroups` (KEP-5963)** on each `consumesCounters[]` | `DRADeviceCompatibilityGroups` on; **schedule time** |
+| **L2** | **Full CounterSet consume** for whole-PF `gpu` / `vfio` | Always when those devices published |
+| **L3** | Prepare-time host checks (MIG mode, foreign mdev, profile mismatch) | Always (defense in depth) |
+| **L4** | Sibling remove/republish | Optional; less critical if L1+L2 correct |
+
+**Do not** use capacity-1 token counters for family locking.
 
 Feature-gate interactions (Alpha proposal):
 
 | Gate combo | Behavior |
 | --- | --- |
-| `VGPUSupport` alone | vGPU counters+partitions; may omit gpu/vfio or publish them with full consume |
-| + `PassthroughSupport` | vfio devices full-consume same CounterSet |
-| + `DynamicMIG` | **Decide in implementation spike:** shared CounterSet namespace vs separate; MIG-backed vGPU likely **composes** with Dynamic MIG counters on same PF — requires one unified counter model per PF |
-| vs `TimeSlicing`/`MPS` on same PF | Disallow concurrent mode while vGPU counters partially spent (prepare reject / don’t advertise sharing configs against vGPU-locked PF) |
+| `VGPUSupport` alone | vGPU counters+partitions; groups when cluster groups gate on |
+| + cluster `DRADeviceCompatibilityGroups` | Publish groups per §6.2.3; MIG↔vGPU and cross-family blocked at schedule |
+| + `PassthroughSupport` | `vfio` full-consume + group `vfio` |
+| + `DynamicMIG` | **Unified PF CounterSet recommended**; container MIG devices use `["mig"]`, vGPU uses `["vgpu-…"]` so coexistence is rejected by groups while sharing one budget model |
+| groups gate **off** | **Omit** `compatibilityGroups` field entirely; rely on allowlist single-family + L3 prepare fallback |
+| vs `TimeSlicing`/`MPS` on same PF | Disallow concurrent mode while vGPU allocated (prepare reject / don’t apply sharing configs) |
 
-> Open design spike: unified PF CounterSet when DynamicMIG + VGPUSupport both on (recommended long-term) vs mutual exclusion of gates (simpler Alpha).
+> Spike remaining: whether DynamicMIG and VGPUSupport share one CounterSet implementation struct or parallel publishers that must still agree on counter set **names** and group labels.
 
 ### 6.8 CDI and KubeVirt contract
 
@@ -794,26 +900,28 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 
 ### Phase 0 — Spikes
 
-- Counter model for 1–2 SKUs (FB + instances + profile exclusivity).
-- Gate interaction with DynamicMIG and PassthroughSupport.
+- Counter model for 1–2 SKUs (FB + instances).
+- **Compatibility group taxonomy** (`vgpu-<slug>`, `mig`, `gpu-full`, `vfio`) under max-2-name constraint.
+- Gate interaction: `DRADeviceCompatibilityGroups` skew (publish vs strip), DynamicMIG, PassthroughSupport.
 - KubeVirt metadata contract for mdev vs vdev.
 - Slice cardinality estimates (profiles × slots × GPUs per node).
 
-### Phase 1 — Alpha MVP (partitionable, non-MIG)
+### Phase 1 — Alpha MVP (partitionable + compatibility groups, non-MIG)
 
 - `VGPUSupport` + SharedCounters + slot partitions for allowlisted profiles.
+- Publish **`compatibilityGroups`** when cluster gate on; strip when off.
 - mdev **or** vdev Prepare/Unprepare (host framework detect).
-- `gpu`/`vfio` full-counter exclusivity when those devices published.
+- `gpu`/`vfio` full-counter + groups when those devices published.
 - CDI + DeviceMetadata + checkpoint.
 - DeviceClass + claim examples with CEL profile selector.
-- Unit tests for consumption matrix; lab e2e.
-- Docs: architecture note, ResourceSlice attributes, KubeVirt guide.
+- Unit tests: counter matrix **and** group intersection matrix; lab e2e (cross-family schedule reject).
+- Docs: architecture, ResourceSlice attributes, compatibility groups, KubeVirt guide.
 
 ### Phase 2 — Density
 
-- MIG-backed partitions (compose Dynamic MIG counters).
-- SR-IOV in-Prepare.
-- Richer exclusivity counters / remove prepare-time family lock if possible.
+- MIG-backed partitions; unified CounterSet with container MIG + disjoint groups (`mig` vs `vgpu-mig`).
+- SR-IOV admin pre-slice hardened; optional DynamicSRIOV later.
+- Drop reliance on prepare-time family lock when groups gate is standard.
 - `vgpu_params` + optional host scheduler knobs.
 - Metrics; slice size controls.
 
@@ -829,10 +937,10 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 
 | Layer | Focus |
 | --- | --- |
-| Unit | Counter costs per profile; exclusivity with full consume; name stability; config validate; checkpoint |
-| Integration | Fake publish of counters+devices slices; allocate two overlapping profiles rejected by scheduler mock |
-| E2E lab | Multi-VM same profile pack; cross-profile blocked; full gpu/vfio blocked while vGPU held; unprepare restores; plugin restart |
-| Negative | Oversubscribe FB; missing vGPU Manager; wrong typeID; MIG create fail rollback |
+| Unit | Counter costs; **group intersection matrix**; strip groups when gate off; name stability; config validate; checkpoint |
+| Integration | Fake counters+devices+groups; scheduler mock rejects mig+vgpu and 12q+24q; allows 12q+12q |
+| E2E lab | Multi-VM same profile pack; **cross-family Pending (not prepare fail)**; full gpu/vfio blocked; unprepare restores; plugin restart; gate-off republish without groups |
+| Negative | Oversubscribe FB; missing vGPU Manager; wrong typeID; MIG create fail rollback; groups declared with gate off (must not publish) |
 | Regression | Dynamic MIG + VFIO demos with `VGPUSupport=false` |
 
 ---
@@ -842,32 +950,36 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 | Risk | Mitigation |
 | --- | --- |
 | Inaccurate counters → silent oversubscribe | SKU catalog review; prepare-time host verify; e2e pack tests |
+| Missing/wrong **compatibilityGroups** → bad packs or prepare fails | Normative group table §6.2.3; intersection unit tests; e2e cross-family |
+| Publish groups while `DRADeviceCompatibilityGroups` off → devices **ignored** by scheduler | Runtime gate detect; strip field; alert metric |
 | ResourceSlice explosion | Allowlist profiles; slot caps; monitor apiserver size |
-| DynamicMIG + VGPU counter clash | Phase 0 spike; prefer unified PF CounterSet or gate mutex for Alpha |
+| DynamicMIG + VGPU counter/group clash | Unified PF CounterSet + disjoint group names (`mig` vs `vgpu-*`) |
 | KubeVirt metadata gaps | Early liaison; unstable env contract documented |
 | Orphan mdevs | Checkpoint + conservative startup cleanup |
 | Double plugin with kubevirt-dynamic-gpu-dp | Docs + taints; detect foreign mdevs |
 | k8s without DRAPartitionableDevices | Gate check at startup; docs prerequisites |
-| Profile family rules not expressible in counters | Temporary prepare lock + republish; fix counter model |
+| Cluster without compatibility groups | Single-family allowlist + prepare fallback; document degraded mode |
 
 ---
 
 ## 10. Open questions
 
-1. Unified CounterSet with DynamicMIG on same PF vs mutual exclusion of gates (Alpha).
+1. Unified CounterSet implementation with DynamicMIG on same PF (recommended) vs separate publishers that only share names.
 2. Exact counter names and FB sources (NVML vs admin catalog).
-3. How to encode “single profile family” purely in counters (token counter vs publish filter).
-4. Slot device naming stability across plugin restarts (must be deterministic).
-5. KubeVirt DeviceMetadata schema for mdev vs vdev.
-6. Whether opaque `profile` remains required anywhere once CEL selectors are standard.
-7. Max partitions per node before split pools / filtering needed.
-8. Should `vgpuInstances` global cap be sum of max profile instances or a separate admin knob?
+3. ~~How to encode single profile family in counters~~ → **resolved: compatibility groups** (`vgpu-<slug>`); confirm slug stability and whether multi-profile **compatible** mixes ever need a shared super-group.
+4. Whether any device needs **two** group names (KEP max 2) for NVIDIA modes, or always exactly one.
+5. Slot device naming stability across plugin restarts (must be deterministic).
+6. KubeVirt DeviceMetadata schema for mdev vs vdev.
+7. Whether opaque `profile` remains required anywhere once CEL selectors are standard.
+8. Max partitions per node before split pools / filtering needed.
+9. `vgpuInstances` global cap vs sum of per-profile max.
+10. How the plugin discovers `DRADeviceCompatibilityGroups` enablement at runtime (API discovery / mirrored config flag).
 
 ---
 
 ## 11. Success metrics
 
-- Alpha: multi-profile ResourceSlices published; scheduler packs N identical profile VMs on one PF up to counter limits; rejects oversubscribe and gpu/vfio collision.
+- Alpha: multi-profile ResourceSlices published **with compatibilityGroups** (when cluster gate on); scheduler packs N identical-family VMs up to counter limits; **rejects cross-family and MIG↔vGPU at schedule time**; rejects oversubscribe and gpu/vfio collision.
 - KubeVirt VM gets working vGPU via DRA only (no classic GPU DP).
 - Unprepare returns counters; subsequent full gpu or other profile works.
 - 100 claim churn cycles without mdev/MIG leak.
@@ -877,8 +989,11 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 
 ## 12. References
 
-- KEP-4815: https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/4815-dra-partitionable-devices
-- Kubernetes DRA partitionable devices: https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/dra-features/
+- KEP-4815 partitionable devices: https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/4815-dra-partitionable-devices
+- **KEP-5963 device compatibility groups:** https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/5963-device-compatibility-groups
+- KEP-5963 merge (enhancements): https://github.com/kubernetes/enhancements/pull/5964
+- KEP-5963 Alpha implementation: https://github.com/kubernetes/kubernetes/pull/139795
+- Kubernetes DRA features (partitionable + compatibility groups): https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/dra-features/
 - Driver architecture: https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/concepts/architecture/
 - GPU allocation / Dynamic MIG: https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/concepts/gpu-allocation/
 - KubeVirt VFIO guide: https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/guides/gpu-allocation/kubevirt-vfio-gpu-passthrough/
@@ -895,7 +1010,8 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 | Per-type plugins + synthetic UUIDs in ListAndWatch | Partition devices in ResourceSlice (`type=vgpu`) |
 | `GetPreferredAllocation` bin pack | SharedCounters remaining (pre-bind) |
 | `maxInstances` per profile | Slot partitions 0..N-1 each consuming counters |
-| Profile exclusivity by marking unavailable | Counters (+ optional republish) |
+| Profile exclusivity by marking unavailable | **compatibilityGroups** per family (+ prepare fallback) |
+| MIG vs vGPU mutual exclusion | Groups `mig` vs `vgpu-*` (KEP-5963 motivating case) |
 | `allocateMdevVgpu` / `allocateVdevVgpu` | NodePrepare on allocated partition |
 | `CreateMigInstance` then vGPU | Prepare MIG-backed partition |
 | Deallocate vGPU then MIG | NodeUnprepare |
@@ -903,9 +1019,15 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 | Env MDEV/PCI | CDI + DeviceMetadata |
 | gpus-in-use files | Checkpoint + claim UID |
 
-## 14. Appendix B — Rejected alternative: single device + capacity
+## 14. Appendix B — Rejected alternatives
 
-Earlier drafts considered one `vgpu-gpu-N` device with `capacity.vgpu.instances`. **Rejected as the product path** because it does not correctly schedule **overlapping multi-profile** layouts without driver-side hide/show races, and diverges from Dynamic MIG. Capacity-only may still appear in internal prototypes but is not the design target.
+### B.1 Single device + capacity
+
+Earlier drafts considered one `vgpu-gpu-N` device with `capacity.vgpu.instances`. **Rejected as the product path** because it does not correctly schedule **overlapping multi-profile** layouts without driver-side hide/show races, and diverges from Dynamic MIG.
+
+### B.2 Capacity-1 “family token” counters
+
+Using a shared counter of capacity 1 decremented by every device in a family **cannot** express “first allocation locks family, subsequent same-family allocations only pay FB/instance costs.” That is exactly why **KEP-5963 compatibility groups** exist. Token counters are **rejected**.
 
 ## 15. Appendix C — Comparison: Dynamic MIG vs vGPU partitions
 
@@ -915,8 +1037,9 @@ Earlier drafts considered one `vgpu-gpu-N` device with `capacity.vgpu.instances`
 | Partition meaning | GI placement | Profile slot or MIG placement + vGPU type |
 | Prepare creates | GI + CI | optional GI+CI + **mdev/vdev** |
 | Consumer | CUDA container | KubeVirt / VFIO-mdev guest |
-| CounterSet | per PF | per PF (ideally unified if both enabled) |
-| Publish path | `partitions.go` + `driver.go` | same path extended |
+| CounterSet | per PF | per PF (ideally **unified** if both enabled) |
+| **compatibilityGroups** | `["mig"]` | `["vgpu-<slug>"]` / `["vgpu-mig"]` |
+| Publish path | `partitions.go` + `driver.go` | same path extended + groups field |
 
 ---
 
@@ -926,3 +1049,4 @@ Earlier drafts considered one `vgpu-gpu-N` device with `capacity.vgpu.instances`
 | --- | --- | --- |
 | 2026-09-01 | Draft | Initial design (capacity-oriented Phase 1) |
 | 2026-09-01 | Draft rev | **Pivot to partitionable devices (KEP-4815) as sole resource model**; ResourceSlice/claim examples; Dynamic MIG alignment |
+| 2026-09-10 | Draft rev | **Integrate KEP-5963 Device Compatibility Groups** for MIG↔vGPU and vGPU family exclusivity; gate skew rules; reject token-counter approach |
