@@ -224,7 +224,12 @@ For each vGPU-capable PF, publish one CounterSet named consistently with Dynamic
 | Counter name | Meaning | Typical value |
 | --- | --- | --- |
 | `framebuffer` | Framebuffer budget (Mi/Gi) | PF FB total |
-| `vgpuInstances` | Coarse instance slots | max concurrent vGPUs under admin policy (often max of profile maxInstances, or a configured cap) |
+
+> There is no `vgpuInstances` counter: advertising exactly `maxInstances` slot
+> devices per profile bounds instance consumption already (and counter keys
+> must be lowercase RFC 1123 labels, so a camelCase name would be rejected by
+> the API anyway). A dedicated instance counter remains an option if an
+> admin-side slot cap lower than the hardware maximum is added later.
 
 **Optional counters:**
 
@@ -236,7 +241,7 @@ For each vGPU-capable PF, publish one CounterSet named consistently with Dynamic
 
 **Counter accounting rules (normative for Alpha):**
 
-1. Every vGPU partition device consumes `framebuffer` equal to that profile’s FB requirement and `vgpuInstances: 1` (unless profile defines otherwise).
+1. Every vGPU partition device consumes `framebuffer` equal to that profile’s FB requirement; the slot device itself is the instance-slot bound.
 2. Full `gpu` and `vfio` devices for the same PF, when advertised, consume **100%** of the CounterSet (capacity-exclusive with any partial partition).
 3. **Do not** invent capacity-1 “family token” counters for mutual exclusion of schemes/families — that charges every device incorrectly. Use **`compatibilityGroups` (KEP-5963)** instead (see §6.2.3).
 4. Prepare-time reject remains a **safety net** for host drift / gate-off clusters, not the primary exclusivity mechanism when groups are available.
@@ -368,7 +373,6 @@ spec:
   - name: gpu-0-counter-set
     counters:
       framebuffer: { value: 48Gi }
-      vgpuInstances: { value: "8" }
 ```
 
 **Devices slice:**
@@ -397,7 +401,6 @@ spec:
     - counterSet: gpu-0-counter-set
       counters:
         framebuffer: { value: 48Gi }
-        vgpuInstances: { value: "8" }
       compatibilityGroups: ["gpu-full"]
 
   # Exclusive VFIO sibling (if PassthroughSupport)
@@ -410,7 +413,6 @@ spec:
     - counterSet: gpu-0-counter-set
       counters:
         framebuffer: { value: 48Gi }
-        vgpuInstances: { value: "8" }
       compatibilityGroups: ["vfio"]
 
   # vGPU partitions — profile 12Q, 4 slots (group vgpu-12q)
@@ -429,7 +431,6 @@ spec:
     - counterSet: gpu-0-counter-set
       counters:
         framebuffer: { value: 12Gi }
-        vgpuInstances: { value: "1" }
       compatibilityGroups: ["vgpu-12q"]
 
   - name: vgpu-gpu-0-12q-1
@@ -438,7 +439,6 @@ spec:
     - counterSet: gpu-0-counter-set
       counters:
         framebuffer: { value: 12Gi }
-        vgpuInstances: { value: "1" }
       compatibilityGroups: ["vgpu-12q"]
   # ... 12q-2, 12q-3 ...
 
@@ -455,7 +455,6 @@ spec:
     - counterSet: gpu-0-counter-set
       counters:
         framebuffer: { value: 24Gi }
-        vgpuInstances: { value: "1" }
       compatibilityGroups: ["vgpu-24q"]
   # ... 24q-1 ...
 ```
@@ -972,7 +971,7 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 6. KubeVirt DeviceMetadata schema for mdev vs vdev.
 7. Whether opaque `profile` remains required anywhere once CEL selectors are standard.
 8. Max partitions per node before split pools / filtering needed.
-9. `vgpuInstances` global cap vs sum of per-profile max.
+9. ~~`vgpuInstances` global cap vs sum of per-profile max~~ → resolved: no instance counter; slot device enumeration is the bound (revisit if admin slot caps land).
 10. How the plugin discovers `DRADeviceCompatibilityGroups` enablement at runtime (API discovery / mirrored config flag).
 
 ---

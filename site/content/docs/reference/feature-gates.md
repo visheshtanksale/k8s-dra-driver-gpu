@@ -45,6 +45,8 @@ The Kubernetes column identifies additional Kubernetes version or Kubernetes fea
 | `HostManagedIMEXDaemon` | Alpha | `false` | No requirements. | Allows `resources.computeDomains.imex.mode=hostManaged`, where you manage the host `nvidia-imex` service instead of the DRA Driver creating per-ComputeDomain daemon DaemonSets. This gate only unlocks the mode. Driver-managed DNS daemon naming and `ComputeDomainClique` tracking are not used in this mode. See [Validate host-managed IMEX](../guides/compute-domain-workloads.md#validate-host-managed-imex). |
 | `DRAListTypeAttributes` | Alpha | `false` | v1.36 or later with `DRAListTypeAttributes=true` on the kube-apiserver and kube-scheduler. | Publishes list-valued DRA device attributes, including `resource.kubernetes.io/numaNode` as a one-element list. See [NUMA locality](resourceslice-attributes.md#numa-locality). |
 | `ConsumableShares` | Alpha | `false` | v1.34 through v1.35 requires `DRAConsumableCapacity=true` on the kube-apiserver, kube-controller-manager, kube-scheduler, and kubelet; v1.36 and later enables `DRAConsumableCapacity` by default; see [Kubernetes consumable capacity](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#consumable-capacity). | Implements Kubernetes DRA consumable capacity for full GPUs and MIG devices by publishing them as multi-allocatable and defining their capacity request policies; also set the [`consumableShares`](helm-values.md#feature-gates) Helm value to select an accounting mode; see [Consumable capacity](../guides/gpu-allocation/consumable-capacity.md). |
+| `VGPUSupport` | Alpha | `false` | v1.34 through v1.35 requires `DRAPartitionableDevices=true` on the kube-apiserver and kube-scheduler; v1.36 and later enables `DRAPartitionableDevices` by default. Requires the NVIDIA vGPU Manager on the host. | Advertises NVIDIA vGPU partition devices (`type=vgpu`, DeviceClass `vgpu.gpu.nvidia.com`) in ResourceSlices as partitionable devices (KEP 4815), one slot device per allowlisted profile. Profiles are selected with the [`vgpu.profiles`](helm-values.md#feature-gates) Helm value. Currently only advertisement is implemented; vGPU claims fail at Prepare time. See the vGPU support design document in the repository (`docs/design/vgpu-support.md`). |
+| `DRADeviceCompatibilityGroups` | Alpha | `false` | Requires `DRADeviceCompatibilityGroups=true` on the kube-apiserver and kube-scheduler. | Publishes KEP 5963 `compatibilityGroups` on device `consumesCounters` entries so the scheduler rejects incompatible co-allocations on one physical GPU (vGPU profile families against each other, MIG against vGPU, partitions against full GPUs). Only enable this when the cluster gate of the same name is on; otherwise the scheduler ignores devices that declare groups. |
 
 ## Constraints
 
@@ -55,6 +57,8 @@ The following feature gate combinations are mutually exclusive and cannot be ena
 | `DynamicMIG` + `PassthroughSupport` | Mutually exclusive |
 | `DynamicMIG` + `MPSSupport` | Mutually exclusive |
 | `PassthroughSupport` + `NVMLDeviceHealthCheck` | Mutually exclusive |
+| `VGPUSupport` + `DynamicMIG` | Mutually exclusive until MIG-backed vGPU partitions share a unified per-GPU CounterSet |
+| `VGPUSupport` + `PassthroughSupport` | Mutually exclusive until VFIO devices are representable in the partitionable-devices publish path |
 
 The feature gates below have the following dependencies:
 

@@ -70,6 +70,8 @@ jobs:
               'ComputeDomainCliques',
               'CrashOnNVLinkFabricErrors',
               'IMEXDaemonsWithDNSNames',
+              'VGPUSupport',
+              'DRADeviceCompatibilityGroups',
             ];
 
             // Only inspect the dedicated "Feature Gates" form field, not the
