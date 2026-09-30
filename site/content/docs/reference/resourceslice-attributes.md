@@ -31,6 +31,7 @@ on it:
 | `gpu` | `gpu.nvidia.com` | Full physical GPU |
 | `mig` | `mig.nvidia.com` | MIG slice |
 | `vfio` | `vfio.gpu.nvidia.com` | VFIO passthrough device |
+| `vgpu` | `vgpu.gpu.nvidia.com` | vGPU partition (abstract; created at Prepare time), requires the `VGPUSupport` feature gate |
 
 The sections below show a representative `spec.devices[]` entry for each type.
 `kubectl` prints map keys alphabetically (so `type` and `uuid` appear last), the
@@ -167,6 +168,62 @@ are illustrative — confirm them on your own cluster.
       value: 40Gi                   # addressable device memory
   name: gpu-vfio-0
 ```
+
+## vGPU partition (type: vgpu)
+
+> **Note:** vGPU support is alpha and requires the `VGPUSupport` feature
+> gate, cluster-side `DRAPartitionableDevices`, and the NVIDIA vGPU Manager
+> on the host. Only advertisement is implemented; claims against these
+> devices fail at Prepare time.
+
+vGPU partitions are abstract devices: one entry per (profile, slot) exists in
+the ResourceSlice before any concrete vGPU device has been created. Selection
+is done via shared counters on the parent GPU's CounterSet, exactly as for
+dynamic MIG. The device name never contains a live mdev UUID or VF PCI
+address; those are produced at Prepare time.
+
+```yaml
+- attributes:
+    profile:
+      string: NVIDIA L40S-12Q       # full vGPU type name
+    profileSlug:
+      string: 12q                   # short, stable ID used in the device name
+    productName:
+      string: NVIDIA L40S           # inherited from the parent GPU
+    resource.kubernetes.io/pciBusID:
+      string: 0000:65:00.0          # PCI bus address of the parent GPU
+    resource.kubernetes.io/pcieRoot:
+      string: pci0000:64            # inherited from the parent GPU
+    slot:
+      int: 2                        # slot index within this profile family (0..maxInstances-1)
+    sriovCapable:
+      bool: true                    # whether the parent PCI function is SR-IOV capable
+    type:
+      string: vgpu                  # device kind
+    typeID:
+      int: 1177                     # numeric vGPU type ID reported by NVML
+    uuid:
+      string: GPU-2fa81118-5a5f-aa66-7660-471eed407181  # parent GPU UUID
+    vgpuFramework:
+      string: mdev                  # host management framework: mdev or vdev
+  consumesCounters:
+  - counterSet: gpu-0-counter-set
+    compatibilityGroups:
+    - vgpu-12q                      # only when the DRADeviceCompatibilityGroups gate is on
+    counters:
+      framebuffer:
+        value: 12Gi                 # framebuffer budget consumed from the parent GPU
+                                  # (no instance counter: maxInstances slot devices are the slot bound)
+  name: vgpu-gpu-0-12q-2
+```
+
+When `VGPUSupport` is enabled, full-GPU devices on a GPU with advertised vGPU
+partitions consume the entire per-GPU CounterSet and (with the
+`DRADeviceCompatibilityGroups` gate) carry the compatibility group
+`gpu-full`, so a full-GPU claim can never be co-scheduled with vGPU
+partitions on the same physical GPU. vGPU partitions of different profile
+families carry disjoint `vgpu-<slug>` groups and cannot be co-scheduled
+either.
 
 ## NUMA locality
 

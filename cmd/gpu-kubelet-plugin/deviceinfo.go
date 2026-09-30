@@ -56,6 +56,12 @@ type GpuInfo struct {
 	maxCapacities PartCapacityMap
 	memSliceCount int
 
+	// vgp profiles advertised for this physical GPU with the VGPUSupport
+	// feature gate: the intersection of host-supported vGPU types and the
+	// admin allowlist. Non-nil only for non-MIG GPUs with at least one
+	// allowlisted, host-supported vGPU profile (see enumerateVgpuPartitions).
+	vgpuProfiles []*VgpuProfileSpec
+
 	// Fabric Manager attributes. Populated only
 	// when an FM Manager is available and the GPU is visible to NVML at
 	// discovery time.

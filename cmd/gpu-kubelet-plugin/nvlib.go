@@ -54,9 +54,15 @@ type deviceLib struct {
 	gpuInfosByUUID    map[string]*GpuInfo
 	gpuUUIDbyPCIBusID map[PCIBusID]string
 	devhandleByUUID   map[string]nvml.Device
+
+	// vgpuProfileAllowlist holds the set of vGPU type names the administrator
+	// allows this driver to advertise (from --vgpu-profiles). Empty means
+	// advertise no vGPU partitions at all (safe default, see
+	// docs/design/vgpu-support.md, section 6.5.1).
+	vgpuProfileAllowlist map[string]bool
 }
 
-func newDeviceLib(driver *root.Driver, hostRoot string) (*deviceLib, error) {
+func newDeviceLib(driver *root.Driver, hostRoot string, vgpuProfiles string) (*deviceLib, error) {
 	driverLibraryPath, err := driver.DriverLibraryPath()
 	if err != nil {
 		return nil, fmt.Errorf("failed to locate driver libraries: %w", err)
@@ -95,6 +101,8 @@ func newDeviceLib(driver *root.Driver, hostRoot string) (*deviceLib, error) {
 		gpuInfosByUUID:    make(map[string]*GpuInfo),
 		gpuUUIDbyPCIBusID: make(map[PCIBusID]string),
 		devhandleByUUID:   make(map[string]nvml.Device),
+
+		vgpuProfileAllowlist: parseVgpuProfileAllowlist(vgpuProfiles),
 	}
 
 	// Current design: when DynamicMIG is enabled, use one long-lived NVML
@@ -315,12 +323,31 @@ func (l deviceLib) GetPerGpuAllocatableDevices(indices ...int) (*PerGPUAllocatab
 			gpuInfo.vfioEnabled = len(migdevs) == 0
 		}
 
+		// Alongside the allocatable full GPU, announce abstract,
+		// not-yet-incarnated vGPU partitions (KEP-4815) for the
+		// allowlisted vGPU types the host can create on it. MIG-enabled
+		// GPUs are intentionally skipped: MIG-backed vGPU partitions are
+		// a later phase (docs/design/vgpu-support.md, section 7).
+		if featuregates.Enabled(featuregates.VGPUSupport) {
+			klog.Infof("Enumerating vGPU partitions for GPU %q", gpuInfo.CanonicalName())
+			vgpuAllocatables, err := l.enumerateVgpuPartitions(gpuInfo, d)
+			if err != nil {
+				return fmt.Errorf("error enumerating vGPU partitions for GPU %q: %w", gpuInfo.CanonicalName(), err)
+			}
+			klog.Infof("VISHESH: vgpuAllocatables: %v", vgpuAllocatables)
+			for name, dev := range vgpuAllocatables {
+				klog.Infof("Adding vGPU partition device %s to allocatable devices (parent: %s)", name, gpuInfo.CanonicalName())
+				thisGPUAllocatable[name] = dev
+			}
+		}
+
 		if !gpuInfo.migEnabled {
 			klog.Infof("Adding device %s to allocatable devices", gpuInfo.CanonicalName())
 			// No static MIG devices prepared for this physical GPU. Announce
 			// physical GPU to be allocatable, and terminate discovery for this
 			// phyical GPU.
 			thisGPUAllocatable[gpuInfo.CanonicalName()] = parentdev
+
 			err = perGPUAllocatable.AddGPUAllocatables(gpuInfo.pciBusID, thisGPUAllocatable)
 			if err != nil {
 				return fmt.Errorf("error adding allocatables for PCI bus ID %q: %w", gpuInfo.pciBusID, err)
@@ -368,6 +395,108 @@ func (l deviceLib) discoverMigDevicesByGPU(gpuInfo *GpuInfo) ([]*AllocatableDevi
 		devices = append(devices, mig)
 	}
 	return devices, nil
+}
+
+// enumerateVgpuPartitions inspects the vGPU types the NVIDIA vGPU Manager on
+// this host can create for the given physical GPU, intersects them with the
+// administrator's profile allowlist, and returns one abstract partition
+// device (KEP-4815) per (profile, slot). It records the accepted profile
+// specs on gpuInfo so the ResourceSlice builder can derive the per-GPU
+// CounterSet for the vGPU partitioning scheme.
+//
+// Discovery is an explicit allowlist (docs/design/vgpu-support.md, section
+// 6.5.1: never publish everything the host supports). An empty allowlist or
+// a host without vGPU support yields no partitions, not an error.
+func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (AllocatableDevices, error) {
+	if len(l.vgpuProfileAllowlist) == 0 {
+		return nil, nil
+	}
+
+	// The framebuffer budget is the only counter of the CounterSet; without
+	// a known GPU memory size it cannot be published, and partitions
+	// referencing a missing CounterSet would be rejected by the API.
+	if gpuInfo.memoryBytes == nil {
+		klog.Warningf("GPU %s memory size unknown; skipping vGPU partition enumeration", gpuInfo.CanonicalName())
+		return nil, nil
+	}
+
+	// Creatable (as opposed to supported) types reflect the host's actual
+	// vGPU Manager configuration and licensing state.
+	types, ret := d.GetCreatableVgpus()
+	switch {
+	case ret == nvml.ERROR_NOT_SUPPORTED:
+		klog.V(4).Infof("GPU %s does not support vGPU; skipping vGPU partition enumeration", gpuInfo.CanonicalName())
+		return nil, nil
+	case ret != nvml.SUCCESS:
+		return nil, fmt.Errorf("error getting creatable vGPU types for GPU %q: %w", gpuInfo.CanonicalName(), ret)
+	}
+	klog.Infof("VISHESH: Creatable vGPU types: %v", types)
+	sysfsRoot := l.sysfsRoot
+	if sysfsRoot == "" {
+		sysfsRoot = "/"
+	}
+	framework, sriovCapable := detectVgpuFramework(sysfsRoot, gpuInfo.pciBusID)
+
+	var profiles []*VgpuProfileSpec
+	for _, typeID := range types {
+		name, ret := typeID.GetName()
+		if ret != nvml.SUCCESS {
+			return nil, fmt.Errorf("error getting name of vGPU type %d: %w", typeID.GetID(), ret)
+		}
+		klog.Infof("VISHESH: Creatable vGPU Types and Names: %v %v", types, name)
+		if !l.vgpuProfileAllowlist[name] {
+			continue
+		}
+
+		framebufferBytes, ret := typeID.GetFramebufferSize()
+		if ret != nvml.SUCCESS {
+			return nil, fmt.Errorf("error getting framebuffer size of vGPU type %q: %w", name, ret)
+		}
+		maxInstances, ret := typeID.GetMaxInstances(d)
+		if ret != nvml.SUCCESS {
+			return nil, fmt.Errorf("error getting max instances of vGPU type %q: %w", name, ret)
+		}
+		if maxInstances < 1 {
+			klog.V(4).Infof("Skipping vGPU type %q on GPU %s: cannot create instances", name, gpuInfo.CanonicalName())
+			continue
+		}
+
+		profiles = append(profiles, &VgpuProfileSpec{
+			Name:             name,
+			TypeID:           typeID.GetID(),
+			FramebufferBytes: framebufferBytes,
+			MaxInstances:     maxInstances,
+		})
+	}
+
+	if len(profiles) == 0 {
+		klog.V(4).Infof("No allowlisted vGPU profiles for GPU %s (creatable types: %d)", gpuInfo.CanonicalName(), len(types))
+		return nil, nil
+	}
+
+	// Sort by profile name for stable device enumeration across restarts.
+	slices.SortFunc(profiles, func(a, b *VgpuProfileSpec) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	gpuInfo.vgpuProfiles = profiles
+
+	allocatable := make(AllocatableDevices)
+	for _, spec := range profiles {
+		for slot := 0; slot < spec.MaxInstances; slot++ {
+			dev := &AllocatableDevice{
+				Vgpu: &VgpuPartitionInfo{
+					Parent:       gpuInfo,
+					Profile:      spec,
+					Slot:         slot,
+					Framework:    framework,
+					SriovCapable: sriovCapable,
+				},
+			}
+			allocatable[dev.Vgpu.CanonicalName()] = dev
+		}
+	}
+
+	return allocatable, nil
 }
 
 // TODO: Need go-nvlib util for this.

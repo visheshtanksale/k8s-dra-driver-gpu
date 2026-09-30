@@ -118,6 +118,7 @@ body:
       options:
         - "ComputeDomainCliques (disabled)"
         - "CrashOnNVLinkFabricErrors (disabled)"
+        - "DRADeviceCompatibilityGroups (enabled)"
         - "DRAListTypeAttributes (enabled)"
         - "DeviceMetadata (enabled)"
         - "DynamicMIG (enabled)"
@@ -128,6 +129,7 @@ body:
         - "NVMLDeviceHealthCheck (enabled)"
         - "PassthroughSupport (enabled)"
         - "TimeSlicingSettings (enabled)"
+        - "VGPUSupport (enabled)"
 
   - type: textarea
     id: helm-values

@@ -86,6 +86,7 @@ Drain ComputeDomain workload pods and delete existing `ComputeDomain` resources 
 |---|---|---|
 | `featureGates` | `{}` | Key-value map of feature gate names to `true` or `false`. Passed to all driver components. Includes both driver-specific gates and upstream Kubernetes logging gates. |
 | `consumableShares` | `""` | Selects the NVIDIA driver's capacity-accounting policy for Kubernetes DRA consumable capacity on full GPUs and MIG devices; set it to `memory`, `unlimited`, or a positive integer, while an empty value leaves sharing disabled; requires `featureGates.ConsumableShares=true`; see [Consumable capacity](../guides/gpu-allocation/consumable-capacity.md). |
+|| `vgpu.profiles` | `""` | Comma-separated allowlist of vGPU type names advertised as vGPU partition devices, for example `NVIDIA L40S-12Q,NVIDIA L40S-24Q`; types not in the allowlist are never advertised, and an empty value advertises no vGPU partitions; requires `featureGates.VGPUSupport=true`; see [ResourceSlice attributes](resourceslice-attributes.md). |
 
 See [Feature gates](feature-gates/) for available gates, defaults, and mutual-exclusion rules.
 

@@ -22,6 +22,8 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/api/validate/constraints"
+
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 )
 
 type PartCapacityMap map[resourceapi.QualifiedName]resourceapi.DeviceCapacity
@@ -63,11 +65,42 @@ func (d *GpuInfo) GetSharedCounterSetName() string {
 	return toRFC1123Compliant(fmt.Sprintf("%s-counter-set", d.CanonicalName()))
 }
 
+// vgpuSharedCounters builds the counters of this GPU's CounterSet for the
+// vGPU partitioning scheme (design: docs/design/vgpu-support.md, section
+// 6.2.1): the GPU's framebuffer budget. There is no instance-slot counter:
+// exactly MaxInstances slot devices per profile are advertised, so slot
+// count is bounded by device enumeration itself. Returns nil when the GPU's
+// framebuffer is unknown — a CounterSet with an empty Counters map is
+// rejected by the API, and framebuffer-less partitions cannot be scheduled
+// meaningfully anyway.
+func (d *GpuInfo) vgpuSharedCounters() map[string]resourceapi.Counter {
+	if d.memoryBytes == nil {
+		return nil
+	}
+	return map[string]resourceapi.Counter{
+		vgpuFramebufferCounterName: {Value: *resource.NewQuantity(int64(*d.memoryBytes), resource.BinarySI)},
+	}
+}
+
 // KEP 4815 device announcement: for now, define exactly one CounterSet per full
 // GPU device. Individual partitions consume from that. In that CounterSet,
 // define one counter per device capacity dimension, and add one counter
 // (capacity 1) per memory slice.
 func (d *GpuInfo) PartSharedCounterSets() []resourceapi.CounterSet {
+	// vGPU partitions share the per-GPU CounterSet name space with MIG
+	// partitions; the two partitioning schemes are mutually exclusive per
+	// GPU (and mutually exclusive feature-gate-wise today).
+	if len(d.vgpuProfiles) > 0 {
+		counters := d.vgpuSharedCounters()
+		if counters == nil {
+			return nil
+		}
+		return []resourceapi.CounterSet{{
+			Name:     d.GetSharedCounterSetName(),
+			Counters: counters,
+		}}
+	}
+
 	// Returns nil when no MIG profile data has been collected for this GPU
 	// (e.g. on Ampere with MIG disabled, or for vGPU guests). Such GPUs have
 	// no partitions, so a per-GPU CounterSet has no consumers and the
@@ -87,15 +120,33 @@ func (d *GpuInfo) PartSharedCounterSets() []resourceapi.CounterSet {
 // allocated, all available counters drop to zero. 2) when the smallest
 // partition gets allocated, the full device cannot be allocated anymore.
 func (d *GpuInfo) PartConsumesCounters() []resourceapi.DeviceCounterConsumption {
-	// Returns nil when no MIG profile data has been collected for this GPU
-	// (matches PartSharedCounterSets — there is no CounterSet to consume from).
-	if len(d.maxCapacities) == 0 {
-		return nil
+	var counters map[string]resourceapi.Counter
+	if len(d.vgpuProfiles) > 0 {
+		// Whole-PF exclusivity against vGPU partitions: consume the entire
+		// vGPU counter set (docs/design/vgpu-support.md, rule 2).
+		counters = d.vgpuSharedCounters()
+		if counters == nil {
+			// Matches PartSharedCounterSets: no framebuffer budget, no
+			// CounterSet, nothing to consume.
+			return nil
+		}
+	} else {
+		// Returns nil when no MIG profile data has been collected for this GPU
+		// (matches PartSharedCounterSets — there is no CounterSet to consume from).
+		if len(d.maxCapacities) == 0 {
+			return nil
+		}
+		counters = addCountersForMemSlices(capacitiesToCounters(d.maxCapacities), 0, d.memSliceCount)
 	}
-	return []resourceapi.DeviceCounterConsumption{{
+
+	consumption := resourceapi.DeviceCounterConsumption{
 		CounterSet: d.GetSharedCounterSetName(),
-		Counters:   addCountersForMemSlices(capacitiesToCounters(d.maxCapacities), 0, d.memSliceCount),
-	}}
+		Counters:   counters,
+	}
+	if featuregates.Enabled(featuregates.DRADeviceCompatibilityGroups) {
+		consumption.CompatibilityGroups = []string{gpuFullCompatibilityGroup}
+	}
+	return []resourceapi.DeviceCounterConsumption{consumption}
 }
 
 // KEP 4815 device announcement: return the 'full' device description.
@@ -207,10 +258,19 @@ func capacitiesToCounters(m PartCapacityMap) map[string]resourceapi.Counter {
 // its name has the form 'gpu-%d-counter-set' where the placeholder is the GPU
 // minor.
 func (i MigSpec) PartConsumesCounters() []resourceapi.DeviceCounterConsumption {
-	return []resourceapi.DeviceCounterConsumption{{
+	consumption := resourceapi.DeviceCounterConsumption{
 		CounterSet: i.Parent.GetSharedCounterSetName(),
 		Counters:   addCountersForMemSlices(capacitiesToCounters(i.Capacities()), int(i.Placement.Start), int(i.Placement.Size)),
-	}}
+	}
+	// The "mig" group is disjoint from all vgpu-* groups so that, once vGPU
+	// and MIG partitions share one per-GPU CounterSet, the scheduler rejects
+	// co-allocation of the two schemes (docs/design/vgpu-support.md, section
+	// 6.2.3). Declared only with the DRADeviceCompatibilityGroups gate; same
+	// P0 skew rule as for vGPU partitions.
+	if featuregates.Enabled(featuregates.DRADeviceCompatibilityGroups) {
+		consumption.CompatibilityGroups = []string{migCompatibilityGroup}
+	}
+	return []resourceapi.DeviceCounterConsumption{consumption}
 }
 
 // A variant of the legacy `GetDevice()`, for the Partitionable Devices paradigm.
@@ -225,6 +285,8 @@ func (d *AllocatableDevice) PartGetDevice(config *Config) resourceapi.Device {
 	case MigDynamicDeviceType:
 		dev = d.MigDynamic.PartGetDevice()
 		applyConsumableShares(&dev, config)
+	case VgpuDeviceType:
+		dev = d.Vgpu.PartGetDevice()
 	case VfioDeviceType:
 		panic("not yet implemented")
 	default:

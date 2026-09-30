@@ -129,7 +129,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	devRoot := driver.DevRoot
 	klog.Infof("Using devRoot=%v", devRoot)
 
-	nvdevlib, err := newDeviceLib(driver, config.flags.hostRoot)
+	nvdevlib, err := newDeviceLib(driver, config.flags.hostRoot, config.flags.vgpuProfiles)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create device library: %w", err)
 	}
@@ -1116,6 +1116,15 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 					Info:   allocatableDevice.Vfio,
 					Device: device,
 				}
+			case VgpuDeviceType:
+				// Advertisement only for now: vGPU partition devices are
+				// schedulable, but creating the concrete mdev/vdev at
+				// Prepare time is not implemented yet. Fail loudly instead of
+				// silently preparing nothing (docs/design/vgpu-support.md,
+				// section 7, Phase 1).
+				return nil, fmt.Errorf("device %q is a vGPU partition; vGPU device lifecycle (mdev/vdev creation at Prepare) is not implemented yet", device.DeviceName)
+			default:
+				return nil, fmt.Errorf("device %q has unexpected type %q", device.DeviceName, allocatableDevice.Type())
 			}
 
 			klog.V(6).Infof("Prepared device for claim '%s': %s", ResourceClaimToString(claim), device.DeviceName)
