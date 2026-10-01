@@ -23,10 +23,23 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/utils/ptr"
 
+	configapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 )
+
+func setVGPUSupportGate(t *testing.T, enabled bool) {
+	t.Helper()
+	original := featuregates.Enabled(featuregates.VGPUSupport)
+	require.NoError(t, featuregates.FeatureGates().SetFromMap(
+		map[string]bool{string(featuregates.VGPUSupport): enabled}))
+	t.Cleanup(func() {
+		require.NoError(t, featuregates.FeatureGates().SetFromMap(
+			map[string]bool{string(featuregates.VGPUSupport): original}))
+	})
+}
 
 func setCompatibilityGroupsGate(t *testing.T, enabled bool) {
 	t.Helper()
@@ -274,7 +287,7 @@ func TestParseVgpuProfileAllowlist(t *testing.T) {
 func TestDetectVgpuFramework(t *testing.T) {
 	bdf := "0000:41:00.0"
 
-	t.Run("mdev types directory", func(t *testing.T) {
+	t.Run("mdev types directory, no SR-IOV", func(t *testing.T) {
 		root := t.TempDir()
 		require.NoError(t, os.MkdirAll(filepath.Join(root, "sys", "bus", "pci", "devices", bdf, "mdev_supported_types", "nvidia-1234"), 0o755))
 
@@ -283,14 +296,37 @@ func TestDetectVgpuFramework(t *testing.T) {
 		assert.False(t, sriov)
 	})
 
-	t.Run("sriov capable means vdev", func(t *testing.T) {
+	t.Run("SR-IOV with vendor VFIO attributes on a VF means vdev", func(t *testing.T) {
 		root := t.TempDir()
-		dir := filepath.Join(root, "sys", "bus", "pci", "devices", bdf)
-		require.NoError(t, os.MkdirAll(dir, 0o755))
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "sriov_totalvfs"), []byte("4"), 0o600))
+		devicesDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+		pfDir := filepath.Join(devicesDir, bdf)
+		require.NoError(t, os.MkdirAll(pfDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(pfDir, "sriov_totalvfs"), []byte("4"), 0o600))
+		// VF carries the vendor-VFIO management attributes (<VF>/nvidia/).
+		vfDir := filepath.Join(devicesDir, "0000:41:01.0", "nvidia")
+		require.NoError(t, os.MkdirAll(vfDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(vfDir, vgpuCurrentTypeFile), []byte("0"), 0o644))
+		require.NoError(t, os.Symlink(filepath.Join(devicesDir, "0000:41:01.0"), filepath.Join(pfDir, "virtfn0")))
 
 		framework, sriov := detectVgpuFramework(root, bdf)
 		assert.Equal(t, vgpuFrameworkVdev, framework)
+		assert.True(t, sriov)
+	})
+
+	t.Run("SR-IOV without VF vGPU attributes means mdev", func(t *testing.T) {
+		// SR-IOV-capable GPUs may still operate under the mdev framework on
+		// hypervisors without the vendor-specific VFIO path.
+		root := t.TempDir()
+		devicesDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+		pfDir := filepath.Join(devicesDir, bdf)
+		require.NoError(t, os.MkdirAll(pfDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(pfDir, "sriov_totalvfs"), []byte("4"), 0o600))
+		vfDir := filepath.Join(devicesDir, "0000:41:01.0")
+		require.NoError(t, os.MkdirAll(vfDir, 0o755))
+		require.NoError(t, os.Symlink(vfDir, filepath.Join(pfDir, "virtfn0")))
+
+		framework, sriov := detectVgpuFramework(root, bdf)
+		assert.Equal(t, vgpuFrameworkMdev, framework)
 		assert.True(t, sriov)
 	})
 
@@ -298,6 +334,71 @@ func TestDetectVgpuFramework(t *testing.T) {
 		framework, sriov := detectVgpuFramework(t.TempDir(), bdf)
 		assert.Equal(t, vgpuFrameworkMdev, framework)
 		assert.False(t, sriov)
+	})
+}
+
+func TestApplyVgpuDeviceConfig(t *testing.T) {
+	setVGPUSupportGate(t, true)
+
+	gpu := newVgpuTestGpu()
+	spec := newVgpuTestProfile("NVIDIA L40S-12Q", 1177, 12<<30, 4)
+	gpu.vgpuProfiles = []*VgpuProfileSpec{spec}
+	partition := &VgpuPartitionInfo{Parent: gpu, Profile: spec, Slot: 0}
+
+	vfioCDIHandler, err := NewVfioCDIHandler(&deviceLib{hostRoot: t.TempDir()})
+	require.NoError(t, err)
+
+	state := &DeviceState{
+		cdi: &CDIHandler{vfiocdi: vfioCDIHandler},
+		perGPUAllocatable: &PerGPUAllocatableDevices{allocatablesMap: map[PCIBusID]AllocatableDevices{
+			gpu.pciBusID: {partition.CanonicalName(): {Vgpu: partition}},
+		}},
+	}
+
+	result := func() *resourceapi.DeviceRequestAllocationResult {
+		return &resourceapi.DeviceRequestAllocationResult{Driver: DriverName, Pool: "pool", Device: partition.CanonicalName(), Request: "r"}
+	}
+
+	t.Run("valid empty config", func(t *testing.T) {
+		cfg := &configapi.VgpuDeviceConfig{}
+		cs, err := state.applyVgpuDeviceConfig(cfg, []*resourceapi.DeviceRequestAllocationResult{result()})
+		require.NoError(t, err)
+		require.NotNil(t, cs.containerEdits)
+		require.Contains(t, cs.containerEdits.Env, "NVIDIA_VISIBLE_DEVICES=void")
+		// libvirt (virt-launcher) requires the VFIO control device for
+		// mediated host-device assignment; the per-device spec only carries
+		// the VF's group node.
+		var nodePaths []string
+		for _, n := range cs.containerEdits.DeviceNodes {
+			nodePaths = append(nodePaths, n.Path)
+		}
+		require.Contains(t, nodePaths, "/dev/vfio/vfio")
+	})
+
+	t.Run("matching profile and typeID", func(t *testing.T) {
+		cfg := &configapi.VgpuDeviceConfig{Profile: "NVIDIA L40S-12Q", TypeID: ptr.To(1177)}
+		_, err := state.applyVgpuDeviceConfig(cfg, []*resourceapi.DeviceRequestAllocationResult{result()})
+		require.NoError(t, err)
+	})
+
+	t.Run("profile mismatch", func(t *testing.T) {
+		cfg := &configapi.VgpuDeviceConfig{Profile: "NVIDIA L40S-24Q"}
+		_, err := state.applyVgpuDeviceConfig(cfg, []*resourceapi.DeviceRequestAllocationResult{result()})
+		require.ErrorContains(t, err, "does not match profile")
+	})
+
+	t.Run("typeID mismatch", func(t *testing.T) {
+		cfg := &configapi.VgpuDeviceConfig{TypeID: ptr.To(1178)}
+		_, err := state.applyVgpuDeviceConfig(cfg, []*resourceapi.DeviceRequestAllocationResult{result()})
+		require.ErrorContains(t, err, "does not match type ID")
+	})
+
+	t.Run("config on non-vgpu device rejected", func(t *testing.T) {
+		state.perGPUAllocatable.allocatablesMap[gpu.pciBusID]["gpu-0"] = &AllocatableDevice{Gpu: gpu}
+		cfg := &configapi.VgpuDeviceConfig{}
+		res := &resourceapi.DeviceRequestAllocationResult{Driver: DriverName, Pool: "pool", Device: "gpu-0", Request: "r"}
+		_, err := state.applyVgpuDeviceConfig(cfg, []*resourceapi.DeviceRequestAllocationResult{res})
+		require.ErrorContains(t, err, "cannot apply VgpuDeviceConfig to device")
 	})
 }
 

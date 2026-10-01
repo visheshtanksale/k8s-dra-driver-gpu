@@ -115,6 +115,31 @@ func TestResourceClaimValidatingWebhook(t *testing.T) {
 			expectedAllowed: false,
 			expectedMessage: "2 configs failed to validate: object at spec.devices.config[0].opaque.parameters is invalid: unknown time-slice interval: Invalid Interval, supported time-slice intervals: Default, Short, Medium, Long; object at spec.devices.config[1].opaque.parameters is invalid: active thread percentage must not be negative",
 		},
+		"valid VgpuDeviceConfig in ResourceClaim": {
+			admissionReview: admissionReviewWithObject(
+				resourceClaimWithVgpuConfig(
+					resourceClaimResourceV1Beta1,
+					&configapi.VgpuDeviceConfig{
+						Profile: "NVIDIA L40S-12Q",
+						TypeID:  ptr.To(1177),
+						Params:  map[string]string{"frame_rate_limiter": "0"},
+					},
+				),
+			),
+			expectedAllowed: true,
+		},
+		"invalid VgpuDeviceConfig in ResourceClaim": {
+			admissionReview: admissionReviewWithObject(
+				resourceClaimWithVgpuConfig(
+					resourceClaimResourceV1Beta1,
+					&configapi.VgpuDeviceConfig{
+						TypeID: ptr.To(-1),
+					},
+				),
+			),
+			expectedAllowed: false,
+			expectedMessage: "1 configs failed to validate: object at spec.devices.config[0].opaque.parameters is invalid: typeID must be non-negative, got -1",
+		},
 		"valid ComputeDomainDaemonConfig in ResourceClaim": {
 			admissionReview: admissionReviewWithObject(
 				resourceClaimWithComputeDomainDaemonConfig(
@@ -540,6 +565,36 @@ func resourceClaimWithComputeDomainDaemonConfig(gvr metav1.GroupVersionResource,
 						DeviceConfiguration: resourceapi.DeviceConfiguration{
 							Opaque: &resourceapi.OpaqueDeviceConfiguration{
 								Driver: ComputeDomainDriverName,
+								Parameters: runtime.RawExtension{
+									Object: config,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func resourceClaimWithVgpuConfig(gvr metav1.GroupVersionResource, config *configapi.VgpuDeviceConfig) *resourceapi.ResourceClaim {
+	config.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   configapi.GroupName,
+		Version: configapi.Version,
+		Kind:    configapi.VgpuDeviceConfigKind,
+	})
+	return &resourceapi.ResourceClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: gvr.Group + "/" + gvr.Version,
+			Kind:       "ResourceClaim",
+		},
+		Spec: resourceapi.ResourceClaimSpec{
+			Devices: resourceapi.DeviceClaim{
+				Config: []resourceapi.DeviceClaimConfiguration{
+					{
+						DeviceConfiguration: resourceapi.DeviceConfiguration{
+							Opaque: &resourceapi.OpaqueDeviceConfiguration{
+								Driver: DriverName,
 								Parameters: runtime.RawExtension{
 									Object: config,
 								},

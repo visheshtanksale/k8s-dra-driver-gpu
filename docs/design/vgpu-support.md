@@ -777,8 +777,14 @@ Input: allocated device name (e.g. vgpu-gpu-0-12q-2) + optional VgpuDeviceConfig
   → SR-IOV: ensure VFs if required
   → if MIG-backed and GI not present for placement:
         CreateMigInstance (GI+CI); record giId
-  → if mdev: create mdev UUID on PF or VF
-    if vdev: SetCurrentVgpuType(vf, typeID); verify MIG id if needed
+  → if mdev: create mdev UUID on the PF (legacy) or on a free VF
+    (SR-IOV mdev: VF is free when its mdev_supported_types/<type>
+    reports available_instances == 1)
+    if vdev (vendor VFIO): find VF with <VF>/nvidia/current_vgpu_type == 0
+    and the wanted type ID present in <VF>/nvidia/creatable_vgpu_types;
+    then write the type ID to current_vgpu_type and verify the read-back
+    (NVIDIA vGPU user guide, "Creating an NVIDIA vGPU ... vendor-specific
+    VFIO framework"); VFs are admin-created via NVIDIA's sriov-manage script
   → SetVgpuParams
   → checkpoint PreparedVgpuDevice { partitionName, concreteId, giId, profile }
   → CDI + DeviceMetadata (mdev UUID or VF PCI, parent UUID, profile, type=vgpu)
@@ -1049,3 +1055,5 @@ Using a shared counter of capacity 1 decremented by every device in a family **c
 | 2026-09-01 | Draft | Initial design (capacity-oriented Phase 1) |
 | 2026-09-01 | Draft rev | **Pivot to partitionable devices (KEP-4815) as sole resource model**; ResourceSlice/claim examples; Dynamic MIG alignment |
 | 2026-09-10 | Draft rev | **Integrate KEP-5963 Device Compatibility Groups** for MIG↔vGPU and vGPU family exclusivity; gate skew rules; reject token-counter approach |
+| 2026-09-30 | Draft rev | Implementation landed (advertisement + mdev/vdev lifecycle). Deltas vs. this document: `VgpuDeviceConfig` ships without the `mig`/`sriov` sub-structs (MIG-backed and DynamicSRIOV remain Phase 2+); no `vgpuInstances` counter (slot enumeration is the bound; counter keys are lowercase RFC 1123 so camelCase was invalid anyway); profile allowlist is a simple `--vgpu-profiles` comma list rather than the §6.5.1 catalog file; concrete-device crash safety uses marker files under the plugin directory in addition to the checkpoint; `DeviceMetadata` gate now also satisfied by `VGPUSupport` (not only `PassthroughSupport`). |
+| 2026-09-30 | Draft rev | Aligned vdev prepare with the NVIDIA vGPU 20.0 user guide: per-VF attributes live in `<VF>/nvidia/` (`current_vgpu_type`, `creatable_vgpu_types`); creatability is validated before the write; VF enablement is the administrator's job via `sriov-manage`; SR-IOV-mdev hosts create per-VF mdevs (one per VF); framework detection probes `<VF>/nvidia/current_vgpu_type`. |

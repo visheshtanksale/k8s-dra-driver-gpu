@@ -173,8 +173,11 @@ are illustrative — confirm them on your own cluster.
 
 > **Note:** vGPU support is alpha and requires the `VGPUSupport` feature
 > gate, cluster-side `DRAPartitionableDevices`, and the NVIDIA vGPU Manager
-> on the host. Only advertisement is implemented; claims against these
-> devices fail at Prepare time.
+> on the host. At Prepare time the driver creates the concrete mediated
+> device (`mdev` framework) or programs the vGPU type of an SR-IOV VF
+> (`vdev` framework, VFs pre-enabled by the administrator), and exposes the
+> result via CDI and Device Metadata (`DeviceMetadata` gate) for VM
+> consumers such as KubeVirt.
 
 vGPU partitions are abstract devices: one entry per (profile, slot) exists in
 the ResourceSlice before any concrete vGPU device has been created. Selection

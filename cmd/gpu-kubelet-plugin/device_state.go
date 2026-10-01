@@ -160,12 +160,15 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		WithLogger(cdilogger),
 	}
 	var vfioCDIHandler *vfioCDIHandler
-	if featuregates.Enabled(featuregates.PassthroughSupport) {
+	if featuregates.Enabled(featuregates.PassthroughSupport) || featuregates.Enabled(featuregates.VGPUSupport) {
 		vfioCDIHandler, err = NewVfioCDIHandler(nvdevlib)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create vfio CDI handler: %w", err)
 		}
 		cdiOptions = append(cdiOptions, WithVfioCDIHandler(vfioCDIHandler))
+	}
+	if featuregates.Enabled(featuregates.VGPUSupport) {
+		cdiOptions = append(cdiOptions, WithVgpuCDIHandler(NewVgpuCDIHandler(nvdevlib)))
 	}
 	cdi, err := NewCDIHandler(cdiOptions...)
 	if err != nil {
@@ -330,6 +333,15 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	// More details: https://github.com/kubernetes/kubernetes/pull/136269
 	if err := s.validateNoOverlappingPreparedDevices(cp, claim); err != nil {
 		return nil, fmt.Errorf("unable to prepare claim %v: %w", claimUID, err)
+	}
+
+	// A previously failed Prepare attempt for this claim may have created
+	// concrete vGPU devices without ever committing them to the checkpoint;
+	// their marker files free them deterministically on this retry.
+	if featuregates.Enabled(featuregates.VGPUSupport) {
+		if err := s.cleanupVgpuMarkersForClaim(claimUID); err != nil {
+			return nil, fmt.Errorf("unable to clean up vGPU devices of a previous failed prepare for claim %v: %w", claimUID, err)
+		}
 	}
 
 	// Relevant for DynamicMIG: a previous preparation attempt for the same
@@ -651,6 +663,14 @@ func (s *DeviceState) unpreparePartiallyPreparedClaim(ctx context.Context, cuid 
 			if err != nil {
 				return fmt.Errorf("failed to roll back partially prepared VFIO devices: %w", err)
 			}
+		}
+	}
+
+	// Free concrete vGPU devices a partially-prepared claim may have created;
+	// the checkpoint does not know them, their marker files do.
+	if featuregates.Enabled(featuregates.VGPUSupport) {
+		if err := s.cleanupVgpuMarkersForClaim(cuid); err != nil {
+			return fmt.Errorf("failed to clean up vGPU devices of partially prepared claim %s: %w", PreparedClaimToString(&pc, cuid), err)
 		}
 	}
 
@@ -1000,27 +1020,14 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 	// config to the set of device allocation results.
 	preparedDeviceGroupConfigState := make(map[runtime.Object]*DeviceConfigState)
 	for c, results := range configResultsMap {
-		// Cast the opaque config to a configapi.Interface type
-		var config configapi.Interface
-		switch castConfig := c.(type) {
-		case *configapi.GpuConfig:
-			config = castConfig
-		case *configapi.MigDeviceConfig:
-			config = castConfig
-		case *configapi.VfioDeviceConfig:
-			config = castConfig
-		default:
-			return nil, fmt.Errorf("runtime object is not a recognized configuration")
-		}
-
-		// Normalize the config to set any implied defaults.
-		if err := config.Normalize(); err != nil {
-			return nil, fmt.Errorf("error normalizing GPU config: %w", err)
-		}
-
-		// Validate the config to ensure its integrity.
-		if err := config.Validate(); err != nil {
-			return nil, fmt.Errorf("error validating GPU config: %w", err)
+		// Cast the opaque config to a configapi.Interface type, normalize it
+		// (implied defaults), and validate it. Shared with the other paths
+		// resolving per-device configs — keep the two from drifting on new
+		// config kinds (this inline cast once silently lacked VgpuDeviceConfig
+		// while normalizeAndValidateConfig knew it, or vice versa).
+		config, err := normalizeAndValidateConfig(c)
+		if err != nil {
+			return nil, err
 		}
 
 		// Apply the config to the list of results associated with it. If this
@@ -1117,12 +1124,23 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 					Device: device,
 				}
 			case VgpuDeviceType:
-				// Advertisement only for now: vGPU partition devices are
-				// schedulable, but creating the concrete mdev/vdev at
-				// Prepare time is not implemented yet. Fail loudly instead of
-				// silently preparing nothing (docs/design/vgpu-support.md,
-				// section 7, Phase 1).
-				return nil, fmt.Errorf("device %q is a vGPU partition; vGPU device lifecycle (mdev/vdev creation at Prepare) is not implemented yet", device.DeviceName)
+				vgpuConfig, ok := c.(*configapi.VgpuDeviceConfig)
+				if !ok {
+					return nil, fmt.Errorf("received invalid config type %T for vgpu device %q", c, device.DeviceName)
+				}
+				concrete, err := s.prepareVgpuDevice(string(claim.UID), allocatableDevice.Vgpu, vgpuConfig)
+				if err != nil {
+					return nil, fmt.Errorf("error creating vGPU device for %q: %w", device.DeviceName, err)
+				}
+				if featuregates.Enabled(featuregates.DeviceMetadata) {
+					device.Metadata = &kubeletplugin.DeviceMetadata{
+						Attributes: vgpuMetadataAttributes(allocatableDevice.Vgpu, concrete),
+					}
+				}
+				preparedDevice.Vgpu = &PreparedVgpuDevice{
+					Concrete: concrete,
+					Device:   device,
+				}
 			default:
 				return nil, fmt.Errorf("device %q has unexpected type %q", device.DeviceName, allocatableDevice.Type())
 			}
@@ -1139,6 +1157,20 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 		preparedDevices = append(preparedDevices, &preparedDeviceGroup)
 	}
 
+	// Every allocated device of this driver must have been prepared. A result
+	// that matched no config group in getConfigResultsMap is silently dropped
+	// from the config-results map; without this check the failure would only
+	// surface later as a confusing CDI error ("invalid spec, no devices").
+	want := 0
+	for i := range claim.Status.Allocation.Devices.Results {
+		if claim.Status.Allocation.Devices.Results[i].Driver == DriverName {
+			want++
+		}
+	}
+	if got := len(preparedDevices.GetDevices()); got != want {
+		return nil, fmt.Errorf("only %d of %d allocated devices were prepared; a device of an unknown type has no matching config group", got, want)
+	}
+
 	return preparedDevices, nil
 }
 
@@ -1151,6 +1183,13 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 			err := s.unprepareVfioDevices(ctx, group.Devices.VfioDevices())
 			if err != nil {
 				return false, fmt.Errorf("error unpreparing VFIO devices: %w", err)
+			}
+		}
+
+		// Destroy the concrete vGPU devices created at prepare time.
+		if featuregates.Enabled(featuregates.VGPUSupport) {
+			if err := s.unprepareVgpuDevices(group.Devices.VgpuDevices()); err != nil {
+				return false, fmt.Errorf("error unpreparing vGPU devices: %w", err)
 			}
 		}
 
@@ -1301,9 +1340,48 @@ func (s *DeviceState) applyConfig(ctx context.Context, config configapi.Interfac
 	case *configapi.VfioDeviceConfig:
 		klog.V(7).Infof("applySharingConfig() for VfioDeviceConfig")
 		return s.applyVfioDeviceConfig(ctx, castConfig, claim, results)
+	case *configapi.VgpuDeviceConfig:
+		klog.V(7).Infof("applyVgpuDeviceConfig() for VgpuDeviceConfig")
+		return s.applyVgpuDeviceConfig(castConfig, results)
 	default:
 		return nil, fmt.Errorf("unknown config type: %T", castConfig)
 	}
+}
+
+// applyVgpuDeviceConfig validates the (optional, identity-pinning) parts of
+// a VgpuDeviceConfig against the allocated partition devices. The Params
+// themselves are applied when the concrete device is created (per device,
+// in prepareVgpuDevice).
+func (s *DeviceState) applyVgpuDeviceConfig(config *configapi.VgpuDeviceConfig, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
+	if !featuregates.Enabled(featuregates.VGPUSupport) {
+		return nil, fmt.Errorf("cannot apply VgpuDeviceConfig: feature gate %s is disabled", featuregates.VGPUSupport)
+	}
+
+	for _, r := range results {
+		device := s.perGPUAllocatable.GetAllocatableDevice(r.Device)
+		if device == nil {
+			return nil, fmt.Errorf("allocatable not found for vgpu device %q", r.Device)
+		}
+		if device.Type() != VgpuDeviceType {
+			return nil, fmt.Errorf("cannot apply VgpuDeviceConfig to device %q of type %q", r.Device, device.Type())
+		}
+		partition := device.Vgpu
+		if config.Profile != "" && config.Profile != partition.Profile.Name {
+			return nil, fmt.Errorf("config profile %q does not match profile %q of allocated device %q", config.Profile, partition.Profile.Name, r.Device)
+		}
+		if config.TypeID != nil && uint32(*config.TypeID) != partition.Profile.TypeID {
+			return nil, fmt.Errorf("config typeID %d does not match type ID %d of allocated device %q", *config.TypeID, partition.Profile.TypeID, r.Device)
+		}
+	}
+
+	// Base container edits for VM-consumed vGPU devices, replacing the
+	// nvidia userspace-library common edits in CreateClaimSpecFile (same
+	// role as for VFIO devices): NVIDIA_VISIBLE_DEVICES=void plus the VFIO
+	// control device libvirt needs for mediated host devices.
+	return &DeviceConfigState{
+		Config:         config,
+		containerEdits: vgpuCommonEdits(),
+	}, nil
 }
 
 func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.Sharing, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult, cp *Checkpoint) (*DeviceConfigState, error) {
@@ -1773,6 +1851,12 @@ func getDeviceConfigsWithDefaults(rawConfigs []resourceapi.DeviceAllocationConfi
 			Config:   configapi.DefaultVfioDeviceConfig(),
 		})
 	}
+	if featuregates.Enabled(featuregates.VGPUSupport) {
+		defaults = append(defaults, &OpaqueDeviceConfig{
+			Requests: []string{},
+			Config:   configapi.DefaultVgpuDeviceConfig(),
+		})
+	}
 
 	return append(defaults, configs...), nil
 }
@@ -1791,6 +1875,10 @@ func validateDeviceConfigType(c runtime.Object, dev *AllocatableDevice, result *
 		if dev.Type() != VfioDeviceType {
 			return fmt.Errorf("cannot apply VfioDeviceConfig to device %q of type %q (request: %v)", result.Device, dev.Type(), result.Request)
 		}
+	case *configapi.VgpuDeviceConfig:
+		if dev.Type() != VgpuDeviceType {
+			return fmt.Errorf("cannot apply VgpuDeviceConfig to device %q of type %q (request: %v)", result.Device, dev.Type(), result.Request)
+		}
 	}
 	return nil
 }
@@ -1803,6 +1891,8 @@ func matchesDeviceType(c runtime.Object, dev *AllocatableDevice) bool {
 		return dev.IsStaticOrDynMigDevice()
 	case *configapi.VfioDeviceConfig:
 		return dev.Type() == VfioDeviceType
+	case *configapi.VgpuDeviceConfig:
+		return dev.Type() == VgpuDeviceType
 	default:
 		return false
 	}
@@ -1817,6 +1907,8 @@ func normalizeAndValidateConfig(c runtime.Object) (configapi.Interface, error) {
 	case *configapi.MigDeviceConfig:
 		config = castConfig
 	case *configapi.VfioDeviceConfig:
+		config = castConfig
+	case *configapi.VgpuDeviceConfig:
 		config = castConfig
 	default:
 		return nil, fmt.Errorf("runtime object is not a recognized configuration: %T", castConfig)
