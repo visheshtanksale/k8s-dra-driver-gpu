@@ -54,6 +54,7 @@ type CDIHandler struct {
 	nvdevice          nvdevice.Interface
 	nvcdiClaim        nvcdi.Interface
 	vfiocdi           *vfioCDIHandler
+	vgpucdi           *vgpuCDIHandler
 	driverRoot        string
 	devRoot           string
 	targetDriverRoot  string
@@ -224,6 +225,17 @@ func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, preparedDevices Prep
 				dspec = dspecsvfio[0]
 			}
 
+			if dev.Type() == VgpuDeviceType {
+				if cdi.vgpucdi == nil {
+					return fmt.Errorf("vgpu CDI handler not available for device %s", dname)
+				}
+				dspecsvgpu, err := cdi.vgpucdi.GetDeviceSpecs(dev.Vgpu.Concrete)
+				if err != nil {
+					return fmt.Errorf("failed to get CDI container edits for vgpu device: %w", err)
+				}
+				dspec = dspecsvgpu[0]
+			}
+
 			if dev.Type() == PreparedMigDeviceType {
 				// Here, get the 'parent dev node' part of the spec. THe spec
 				// fragment for other dev nodes specific to this MIG device is
@@ -256,6 +268,7 @@ func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, preparedDevices Prep
 			// on the group), add them to the spec for this device.
 			if group.ConfigState.containerEdits != nil {
 				var isVfioDeviceConfigType bool
+				var isVgpuDeviceConfigType bool
 				if group.ConfigState.Config != nil {
 					// If claim requests vfio devices, we assume that all vfio
 					// device requests use the same config. We also assume that
@@ -266,11 +279,20 @@ func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, preparedDevices Prep
 					if isVfioDeviceConfigType {
 						commonEdits = group.ConfigState.containerEdits
 					}
+					// Same treatment for vGPU devices: consumers are VMs
+					// (KubeVirt), for which the NVIDIA userspace-library
+					// common edits are replaced by the minimal base edits
+					// assembled in applyVgpuDeviceConfig.
+					_, isVgpuDeviceConfigType = group.ConfigState.Config.(*configapi.VgpuDeviceConfig)
+					if isVgpuDeviceConfigType {
+						commonEdits = group.ConfigState.containerEdits
+					}
 				}
 
-				// Only non-vfio devices require the group config state to be applied to
-				// the device cdi spec.
-				if !isVfioDeviceConfigType {
+				// Only non-vfio and non-vgpu devices require the group config
+				// state to be applied to the device cdi spec (for vfio/vgpu the
+				// group's edits replaced the common edits instead, above).
+				if !isVfioDeviceConfigType && !isVgpuDeviceConfigType {
 					deviceEdits := &cdiapi.ContainerEdits{
 						ContainerEdits: &dspec.ContainerEdits,
 					}

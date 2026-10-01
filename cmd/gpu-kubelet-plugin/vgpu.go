@@ -207,23 +207,54 @@ func parseVgpuProfileAllowlist(raw string) map[string]bool {
 }
 
 // detectVgpuFramework determines whether the host manages vGPU devices for
-// the physical function identified by pciBusID through the classic mdev
-// framework or through SR-IOV VFs with a programmable vGPU type ("vdev"),
-// by probing sysfs below sysfsRoot. SR-IOV presence wins over
-// mdev_supported_types: on hosts exposing both, vGPU Manager assigns types
-// per VF. Best-effort: absence of both does not fail advertisement, because
-// the framework is only exercised at Prepare time.
+// the physical function identified by pciBusID through the mediated
+// framework ("mdev") or the vendor-specific VFIO framework ("vdev"), as
+// documented for NVIDIA vGPU software on KVM hypervisors. On vdev hosts the
+// vGPU manager exposes vgpu_type attributes under each VF's nvidia/
+// directory (<VF>/nvidia/current_vgpu_type); on mdev hosts it exposes
+// mdev_supported_types (legacy GPUs: on the PF; SR-IOV GPUs with mdev: on
+// the VFs). Best-effort only: absence of everything does not fail
+// advertisement, since the framework is exercised at Prepare time.
 func detectVgpuFramework(sysfsRoot string, pciBusID string) (framework string, sriovCapable bool) {
 	deviceDir := filepath.Join(sysfsRoot, "sys", "bus", "pci", "devices", pciBusID)
 
-	if _, err := os.Stat(filepath.Join(deviceDir, "sriov_totalvfs")); err == nil {
-		sriovCapable = true
-	}
-	if sriovCapable {
-		return vgpuFrameworkVdev, true
-	}
-	if entries, err := os.ReadDir(filepath.Join(deviceDir, "mdev_supported_types")); err == nil && len(entries) > 0 {
+	if _, err := os.Stat(filepath.Join(deviceDir, "sriov_totalvfs")); err != nil {
+		// No SR-IOV: legacy GPU; only mdev exists.
 		return vgpuFrameworkMdev, false
 	}
-	return vgpuFrameworkMdev, false
+
+	// The vendor-specific VFIO framework (vGPU 17+ style) exposes
+	// current_vgpu_type per VF inside the VF's nvidia/ directory. It is only
+	// meaningful once VFs are enabled, so check any existing VF.
+	for _, vf := range vgpuVFsOfPF(deviceDir) {
+		if _, err := os.Stat(filepath.Join(vgpuVFNVidiaDir(sysfsRoot, vf), vgpuCurrentTypeFile)); err == nil {
+			return vgpuFrameworkVdev, true
+		}
+	}
+	return vgpuFrameworkMdev, true
+}
+
+// vgpuVFsOfPF returns the PCI bus IDs of the currently enabled VFs of the PF
+// whose sysfs directory is pfDir, or nil when none are enabled.
+func vgpuVFsOfPF(pfDir string) []string {
+	entries, err := filepath.Glob(filepath.Join(pfDir, "virtfn*"))
+	if err != nil {
+		return nil
+	}
+	var vfs []string
+	for _, symlink := range entries {
+		target, err := filepath.EvalSymlinks(symlink)
+		if err != nil {
+			continue
+		}
+		vfs = append(vfs, filepath.Base(target))
+	}
+	return vfs
+}
+
+// vgpuVFNVidiaDir returns the sysfs directory holding the vGPU manager
+// attributes for a VF under the vendor-specific VFIO framework:
+// <VF>/nvidia/{current_vgpu_type, creatable_vgpu_types, gpu_instance_id}.
+func vgpuVFNVidiaDir(sysfsRoot string, vfBusID string) string {
+	return filepath.Join(sysfsRoot, "sys", "bus", "pci", "devices", vfBusID, "nvidia")
 }

@@ -298,8 +298,8 @@ func ValidateFeatureGates() error {
 		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", PassthroughSupport, NVMLDeviceHealthCheck)
 	}
 
-	if Enabled(DeviceMetadata) && !Enabled(PassthroughSupport) {
-		return fmt.Errorf("feature gate %s requires %s to also be enabled", DeviceMetadata, PassthroughSupport)
+	if Enabled(DeviceMetadata) && !Enabled(PassthroughSupport) && !Enabled(VGPUSupport) {
+		return fmt.Errorf("feature gate %s requires %s or %s to also be enabled", DeviceMetadata, PassthroughSupport, VGPUSupport)
 	}
 
 	// vGPU partitions are advertised through the same KEP-4815 publish path
