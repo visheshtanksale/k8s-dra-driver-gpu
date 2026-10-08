@@ -17,10 +17,9 @@ limitations under the License.
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
@@ -52,10 +51,10 @@ func setCompatibilityGroupsGate(t *testing.T, enabled bool) {
 	})
 }
 
-func newVgpuTestProfile(name string, typeID uint32, fbBytes uint64, maxInstances int) *VgpuProfileSpec {
+func newVgpuTestProfile(name string, profileID uint32, fbBytes uint64, maxInstances int) *VgpuProfileSpec {
 	return &VgpuProfileSpec{
 		Name:             name,
-		TypeID:           typeID,
+		ProfileID:        profileID,
 		FramebufferBytes: fbBytes,
 		MaxInstances:     maxInstances,
 	}
@@ -103,7 +102,7 @@ func TestVgpuPartitionCanonicalName(t *testing.T) {
 		Slot:    2,
 	}
 
-	// docs/design/vgpu-support.md: vgpu-gpu-<minor>-<profileSlug>-<slot>.
+	// docs/design/vgpu-support.md: vgpu-gpu-<minor>-<shortProfileName>-<slot>.
 	// The name must be deterministic across plugin restarts: it only depends
 	// on the parent minor, the profile slug, and the slot index.
 	require.Equal(t, "vgpu-gpu-0-12q-2", partition.CanonicalName())
@@ -113,11 +112,10 @@ func TestVgpuPartitionGetDeviceAttributes(t *testing.T) {
 	gpu := newVgpuTestGpu()
 	spec := newVgpuTestProfile("NVIDIA L40S-12Q", 1177, 12<<30, 4)
 	partition := &VgpuPartitionInfo{
-		Parent:       gpu,
-		Profile:      spec,
-		Slot:         1,
-		Framework:    vgpuFrameworkMdev,
-		SriovCapable: true,
+		Parent:    gpu,
+		Profile:   spec,
+		Slot:      1,
+		Framework: vgpuFrameworkMdev,
 	}
 
 	dev := partition.PartGetDevice()
@@ -127,14 +125,13 @@ func TestVgpuPartitionGetDeviceAttributes(t *testing.T) {
 	attrs := dev.Attributes
 	require.Equal(t, VgpuDeviceType, *attrs["type"].StringValue)
 	require.Equal(t, "NVIDIA L40S-12Q", *attrs["profile"].StringValue)
-	require.Equal(t, "12q", *attrs["profileSlug"].StringValue)
+	require.Equal(t, "12q", *attrs["shortProfileName"].StringValue)
 	require.Equal(t, int64(1), *attrs["slot"].IntValue)
 	// `uuid` carries the parent GPU UUID by design.
 	require.Equal(t, gpu.UUID, *attrs["uuid"].StringValue)
 	require.Equal(t, gpu.productName, *attrs["productName"].StringValue)
 	require.Equal(t, vgpuFrameworkMdev, *attrs["vgpuFramework"].StringValue)
-	require.Equal(t, true, *attrs["sriovCapable"].BoolValue)
-	require.Equal(t, int64(1177), *attrs["typeID"].IntValue)
+	require.Equal(t, int64(1177), *attrs["profileID"].IntValue)
 }
 
 func TestVgpuPartitionConsumesCounters(t *testing.T) {
@@ -147,7 +144,7 @@ func TestVgpuPartitionConsumesCounters(t *testing.T) {
 
 		cc := partition.PartConsumesCounters()
 		require.Len(t, cc, 1)
-		require.Equal(t, "gpu-0-counter-set", cc[0].CounterSet)
+		require.Equal(t, "vgpu-0-counter-set", cc[0].CounterSet)
 		require.Equal(t, int64(12<<30), counterValue(t, cc[0].Counters, vgpuFramebufferCounterName))
 		// One instance slot per slot device is implied by enumeration.
 		require.Len(t, cc[0].Counters, 1)
@@ -194,11 +191,16 @@ func TestVgpuGroupIntersectionMatrix(t *testing.T) {
 	fullGPU := gpu.PartConsumesCounters()[0].CompatibilityGroups
 	migPartition := []string{migCompatibilityGroup}
 
+	vfio := []string{vfioCompatibilityGroup}
+
 	assert.True(t, intersect(slotOf(spec12q, 0), slotOf(spec12q, 1)), "same family packs")
 	assert.False(t, intersect(slotOf(spec12q, 0), slotOf(spec24q, 0)), "cross-family blocked")
 	assert.False(t, intersect(slotOf(spec12q, 0), migPartition), "mig vs vgpu blocked")
 	assert.False(t, intersect(slotOf(spec12q, 0), fullGPU), "full GPU vs vgpu blocked")
 	assert.False(t, intersect(migPartition, fullGPU), "mig vs full GPU blocked")
+	assert.False(t, intersect(vfio, slotOf(spec12q, 0)), "vfio vs vgpu blocked")
+	assert.False(t, intersect(vfio, fullGPU), "vfio vs full GPU blocked")
+	assert.False(t, intersect(vfio, migPartition), "vfio vs mig blocked")
 }
 
 func TestVgpuGpuCounterSets(t *testing.T) {
@@ -209,7 +211,7 @@ func TestVgpuGpuCounterSets(t *testing.T) {
 
 	sets := gpu.PartSharedCounterSets()
 	require.Len(t, sets, 1)
-	require.Equal(t, "gpu-0-counter-set", sets[0].Name)
+	require.Equal(t, "vgpu-0-counter-set", sets[0].Name)
 
 	shared := sets[0].Counters
 	require.Equal(t, int64(48<<30), counterValue(t, shared, vgpuFramebufferCounterName))
@@ -285,55 +287,25 @@ func TestParseVgpuProfileAllowlist(t *testing.T) {
 }
 
 func TestDetectVgpuFramework(t *testing.T) {
-	bdf := "0000:41:00.0"
-
-	t.Run("mdev types directory, no SR-IOV", func(t *testing.T) {
-		root := t.TempDir()
-		require.NoError(t, os.MkdirAll(filepath.Join(root, "sys", "bus", "pci", "devices", bdf, "mdev_supported_types", "nvidia-1234"), 0o755))
-
-		framework, sriov := detectVgpuFramework(root, bdf)
-		assert.Equal(t, vgpuFrameworkMdev, framework)
-		assert.False(t, sriov)
+	t.Run("SR-IOV host vGPU mode means vf framework", func(t *testing.T) {
+		framework := detectVgpuFramework(func() (nvml.HostVgpuMode, nvml.Return) {
+			return nvml.HOST_VGPU_MODE_SRIOV, nvml.SUCCESS
+		})
+		assert.Equal(t, vgpuFrameworkVf, framework)
 	})
 
-	t.Run("SR-IOV with vendor VFIO attributes on a VF means vdev", func(t *testing.T) {
-		root := t.TempDir()
-		devicesDir := filepath.Join(root, "sys", "bus", "pci", "devices")
-		pfDir := filepath.Join(devicesDir, bdf)
-		require.NoError(t, os.MkdirAll(pfDir, 0o755))
-		require.NoError(t, os.WriteFile(filepath.Join(pfDir, "sriov_totalvfs"), []byte("4"), 0o600))
-		// VF carries the vendor-VFIO management attributes (<VF>/nvidia/).
-		vfDir := filepath.Join(devicesDir, "0000:41:01.0", "nvidia")
-		require.NoError(t, os.MkdirAll(vfDir, 0o755))
-		require.NoError(t, os.WriteFile(filepath.Join(vfDir, vgpuCurrentTypeFile), []byte("0"), 0o644))
-		require.NoError(t, os.Symlink(filepath.Join(devicesDir, "0000:41:01.0"), filepath.Join(pfDir, "virtfn0")))
-
-		framework, sriov := detectVgpuFramework(root, bdf)
-		assert.Equal(t, vgpuFrameworkVdev, framework)
-		assert.True(t, sriov)
+	t.Run("non-SR-IOV host vGPU mode means mdev", func(t *testing.T) {
+		framework := detectVgpuFramework(func() (nvml.HostVgpuMode, nvml.Return) {
+			return nvml.HOST_VGPU_MODE_NON_SRIOV, nvml.SUCCESS
+		})
+		assert.Equal(t, vgpuFrameworkMdev, framework)
 	})
 
-	t.Run("SR-IOV without VF vGPU attributes means mdev", func(t *testing.T) {
-		// SR-IOV-capable GPUs may still operate under the mdev framework on
-		// hypervisors without the vendor-specific VFIO path.
-		root := t.TempDir()
-		devicesDir := filepath.Join(root, "sys", "bus", "pci", "devices")
-		pfDir := filepath.Join(devicesDir, bdf)
-		require.NoError(t, os.MkdirAll(pfDir, 0o755))
-		require.NoError(t, os.WriteFile(filepath.Join(pfDir, "sriov_totalvfs"), []byte("4"), 0o600))
-		vfDir := filepath.Join(devicesDir, "0000:41:01.0")
-		require.NoError(t, os.MkdirAll(vfDir, 0o755))
-		require.NoError(t, os.Symlink(vfDir, filepath.Join(pfDir, "virtfn0")))
-
-		framework, sriov := detectVgpuFramework(root, bdf)
+	t.Run("NVML NOT_SUPPORTED falls back to mdev", func(t *testing.T) {
+		framework := detectVgpuFramework(func() (nvml.HostVgpuMode, nvml.Return) {
+			return 0, nvml.ERROR_NOT_SUPPORTED
+		})
 		assert.Equal(t, vgpuFrameworkMdev, framework)
-		assert.True(t, sriov)
-	})
-
-	t.Run("nothing found defaults to mdev", func(t *testing.T) {
-		framework, sriov := detectVgpuFramework(t.TempDir(), bdf)
-		assert.Equal(t, vgpuFrameworkMdev, framework)
-		assert.False(t, sriov)
 	})
 }
 
@@ -375,8 +347,8 @@ func TestApplyVgpuDeviceConfig(t *testing.T) {
 		require.Contains(t, nodePaths, "/dev/vfio/vfio")
 	})
 
-	t.Run("matching profile and typeID", func(t *testing.T) {
-		cfg := &configapi.VgpuDeviceConfig{Profile: "NVIDIA L40S-12Q", TypeID: ptr.To(1177)}
+	t.Run("matching profile and profileID", func(t *testing.T) {
+		cfg := &configapi.VgpuDeviceConfig{Profile: "NVIDIA L40S-12Q", ProfileID: ptr.To(1177)}
 		_, err := state.applyVgpuDeviceConfig(cfg, []*resourceapi.DeviceRequestAllocationResult{result()})
 		require.NoError(t, err)
 	})
@@ -387,10 +359,10 @@ func TestApplyVgpuDeviceConfig(t *testing.T) {
 		require.ErrorContains(t, err, "does not match profile")
 	})
 
-	t.Run("typeID mismatch", func(t *testing.T) {
-		cfg := &configapi.VgpuDeviceConfig{TypeID: ptr.To(1178)}
+	t.Run("profileID mismatch", func(t *testing.T) {
+		cfg := &configapi.VgpuDeviceConfig{ProfileID: ptr.To(1178)}
 		_, err := state.applyVgpuDeviceConfig(cfg, []*resourceapi.DeviceRequestAllocationResult{result()})
-		require.ErrorContains(t, err, "does not match type ID")
+		require.ErrorContains(t, err, "does not match profile ID")
 	})
 
 	t.Run("config on non-vgpu device rejected", func(t *testing.T) {

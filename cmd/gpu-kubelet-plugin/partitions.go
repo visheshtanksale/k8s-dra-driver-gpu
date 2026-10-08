@@ -65,6 +65,14 @@ func (d *GpuInfo) GetSharedCounterSetName() string {
 	return toRFC1123Compliant(fmt.Sprintf("%s-counter-set", d.CanonicalName()))
 }
 
+// KEP 4815 device announcement: the CounterSet name for the vGPU
+// partitioning scheme (`vgpu-<minor>-counter-set`). Distinct from the MIG
+// scheme's per-GPU name so the vGPU budget is self-identifying in the
+// slices and does not share a name if a GPU ever shows both schemes.
+func (d *GpuInfo) VgpuSharedCounterSetName() string {
+	return toRFC1123Compliant(fmt.Sprintf("vgpu-%d-counter-set", d.minor))
+}
+
 // vgpuSharedCounters builds the counters of this GPU's CounterSet for the
 // vGPU partitioning scheme (design: docs/design/vgpu-support.md, section
 // 6.2.1): the GPU's framebuffer budget. There is no instance-slot counter:
@@ -96,7 +104,7 @@ func (d *GpuInfo) PartSharedCounterSets() []resourceapi.CounterSet {
 			return nil
 		}
 		return []resourceapi.CounterSet{{
-			Name:     d.GetSharedCounterSetName(),
+			Name:     d.VgpuSharedCounterSetName(),
 			Counters: counters,
 		}}
 	}
@@ -139,8 +147,12 @@ func (d *GpuInfo) PartConsumesCounters() []resourceapi.DeviceCounterConsumption 
 		counters = addCountersForMemSlices(capacitiesToCounters(d.maxCapacities), 0, d.memSliceCount)
 	}
 
+	counterSetName := d.GetSharedCounterSetName()
+	if len(d.vgpuProfiles) > 0 {
+		counterSetName = d.VgpuSharedCounterSetName()
+	}
 	consumption := resourceapi.DeviceCounterConsumption{
-		CounterSet: d.GetSharedCounterSetName(),
+		CounterSet: counterSetName,
 		Counters:   counters,
 	}
 	if featuregates.Enabled(featuregates.DRADeviceCompatibilityGroups) {
@@ -288,7 +300,7 @@ func (d *AllocatableDevice) PartGetDevice(config *Config) resourceapi.Device {
 	case VgpuDeviceType:
 		dev = d.Vgpu.PartGetDevice()
 	case VfioDeviceType:
-		panic("not yet implemented")
+		dev = d.Vfio.PartGetDevice()
 	default:
 		panic("unexpected type for AllocatableDevice")
 	}

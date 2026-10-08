@@ -324,6 +324,29 @@ func (d *VfioDeviceInfo) GetDevice() resourceapi.Device {
 	return device
 }
 
+// PartGetDevice returns the KEP-4815 representation of this VFIO device for
+// the partitionable-devices publish path (used with the VGPUSupport feature
+// gate). When the parent GPU also advertises vGPU partitions, the Resources
+// for this device consume the full parent CounterSet (same whole-PF
+// exclusivity rule as the full gpu device, docs/design/vgpu-support.md FR-3b)
+// and the "vfio" compatibility group, disjoint from vgpu-* and mig.
+func (d *VfioDeviceInfo) PartGetDevice() resourceapi.Device {
+	dev := d.GetDevice()
+	parent := d.parent
+	if parent == nil || len(parent.vgpuProfiles) == 0 || parent.vgpuSharedCounters() == nil {
+		return dev
+	}
+	consumption := resourceapi.DeviceCounterConsumption{
+		CounterSet: parent.VgpuSharedCounterSetName(),
+		Counters:   parent.vgpuSharedCounters(),
+	}
+	if featuregates.Enabled(featuregates.DRADeviceCompatibilityGroups) {
+		consumption.CompatibilityGroups = []string{vfioCompatibilityGroup}
+	}
+	dev.ConsumesCounters = []resourceapi.DeviceCounterConsumption{consumption}
+	return dev
+}
+
 func addDeviceAttribute(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, attr *deviceattribute.DeviceAttribute) {
 	if attr != nil {
 		attrs[attr.Name] = attr.Value

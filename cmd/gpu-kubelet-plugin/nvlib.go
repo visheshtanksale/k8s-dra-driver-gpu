@@ -60,6 +60,10 @@ type deviceLib struct {
 	// advertise no vGPU partitions at all (safe default, see
 	// docs/design/vgpu-support.md, section 6.5.1).
 	vgpuProfileAllowlist map[string]bool
+
+	// vgpuMdev is the mediated-device backend used by the vGPU lifecycle
+	// (go-nvlib/pkg/nvmdev in production; faked in unit tests).
+	vgpuMdev vgpuMdevStore
 }
 
 func newDeviceLib(driver *root.Driver, hostRoot string, vgpuProfiles string) (*deviceLib, error) {
@@ -103,6 +107,7 @@ func newDeviceLib(driver *root.Driver, hostRoot string, vgpuProfiles string) (*d
 		devhandleByUUID:   make(map[string]nvml.Device),
 
 		vgpuProfileAllowlist: parseVgpuProfileAllowlist(vgpuProfiles),
+		vgpuMdev:             newNvmdevMdevStore(nvpci),
 	}
 
 	// Current design: when DynamicMIG is enabled, use one long-lived NVML
@@ -431,28 +436,27 @@ func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (Al
 		return nil, fmt.Errorf("error getting creatable vGPU types for GPU %q: %w", gpuInfo.CanonicalName(), ret)
 	}
 	klog.Infof("VISHESH: Creatable vGPU types: %v", types)
-	sysfsRoot := l.sysfsRoot
-	if sysfsRoot == "" {
-		sysfsRoot = "/"
-	}
-	framework, sriovCapable := detectVgpuFramework(sysfsRoot, gpuInfo.pciBusID)
+	// Detect the host's vGPU framework from NVML
+	// (nvmlDeviceGetHostVgpuMode), not sysfs: SR-IOV mode implies the
+	// vendor-specific VFIO path ("vf"), otherwise mdev.
+	framework := detectVgpuFramework(d.GetHostVgpuMode)
 
 	var profiles []*VgpuProfileSpec
-	for _, typeID := range types {
-		name, ret := typeID.GetName()
+	for _, profileID := range types {
+		name, ret := profileID.GetName()
 		if ret != nvml.SUCCESS {
-			return nil, fmt.Errorf("error getting name of vGPU type %d: %w", typeID.GetID(), ret)
+			return nil, fmt.Errorf("error getting name of vGPU type %d: %w", profileID.GetID(), ret)
 		}
 		klog.Infof("VISHESH: Creatable vGPU Types and Names: %v %v", types, name)
 		if !l.vgpuProfileAllowlist[name] {
 			continue
 		}
 
-		framebufferBytes, ret := typeID.GetFramebufferSize()
+		framebufferBytes, ret := profileID.GetFramebufferSize()
 		if ret != nvml.SUCCESS {
 			return nil, fmt.Errorf("error getting framebuffer size of vGPU type %q: %w", name, ret)
 		}
-		maxInstances, ret := typeID.GetMaxInstances(d)
+		maxInstances, ret := profileID.GetMaxInstances(d)
 		if ret != nvml.SUCCESS {
 			return nil, fmt.Errorf("error getting max instances of vGPU type %q: %w", name, ret)
 		}
@@ -463,7 +467,7 @@ func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (Al
 
 		profiles = append(profiles, &VgpuProfileSpec{
 			Name:             name,
-			TypeID:           typeID.GetID(),
+			ProfileID:        profileID.GetID(),
 			FramebufferBytes: framebufferBytes,
 			MaxInstances:     maxInstances,
 		})
@@ -485,11 +489,10 @@ func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (Al
 		for slot := 0; slot < spec.MaxInstances; slot++ {
 			dev := &AllocatableDevice{
 				Vgpu: &VgpuPartitionInfo{
-					Parent:       gpuInfo,
-					Profile:      spec,
-					Slot:         slot,
-					Framework:    framework,
-					SriovCapable: sriovCapable,
+					Parent:    gpuInfo,
+					Profile:   spec,
+					Slot:      slot,
+					Framework: framework,
 				},
 			}
 			allocatable[dev.Vgpu.CanonicalName()] = dev

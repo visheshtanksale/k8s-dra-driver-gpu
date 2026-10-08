@@ -41,16 +41,16 @@ func TestVgpuDeviceConfigValidate(t *testing.T) {
 		},
 		"full config is valid": {
 			config: &VgpuDeviceConfig{
-				Profile: "NVIDIA L40S-12Q",
-				TypeID:  ptr.To(1177),
-				Params:  map[string]string{"frame_rate_limiter": "0"},
+				Profile:   "NVIDIA L40S-12Q",
+				ProfileID: ptr.To(1177),
+				Params:    map[string]string{"frame_rate_limiter": "0"},
 			},
 		},
-		"zero typeID allowed": {
-			config: &VgpuDeviceConfig{TypeID: &[]int{0}[0]},
+		"zero profileID allowed": {
+			config: &VgpuDeviceConfig{ProfileID: &[]int{0}[0]},
 		},
-		"negative typeID rejected": {
-			config:      &VgpuDeviceConfig{TypeID: &negative},
+		"negative profileID rejected": {
+			config:      &VgpuDeviceConfig{ProfileID: &negative},
 			expectError: true,
 		},
 		"empty param key rejected": {
@@ -58,7 +58,7 @@ func TestVgpuDeviceConfigValidate(t *testing.T) {
 			expectError: true,
 		},
 		"one-pass sanity": {
-			config: &VgpuDeviceConfig{TypeID: &one},
+			config: &VgpuDeviceConfig{ProfileID: &one},
 		},
 	}
 
@@ -80,7 +80,7 @@ func TestVgpuDeviceConfigStrictDecoding(t *testing.T) {
 		"apiVersion": "resource.nvidia.com/v1beta1",
 		"kind":       "VgpuDeviceConfig",
 		"profile":    "NVIDIA L40S-12Q",
-		"typeID":     1177,
+		"profileID":  1177,
 		"params":     map[string]string{"frame_rate_limiter": "0"},
 	}
 	data, err := json.Marshal(raw)
@@ -91,7 +91,7 @@ func TestVgpuDeviceConfigStrictDecoding(t *testing.T) {
 	config, ok := decoded.(*VgpuDeviceConfig)
 	require.True(t, ok)
 	assert.Equal(t, "NVIDIA L40S-12Q", config.Profile)
-	assert.Equal(t, 1177, *config.TypeID)
+	assert.Equal(t, 1177, *config.ProfileID)
 	assert.Equal(t, "0", config.Params["frame_rate_limiter"])
 
 	// Unknown fields must be rejected by the strict decoder.

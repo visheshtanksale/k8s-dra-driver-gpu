@@ -378,7 +378,10 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	}
 
 	// TODO: Remove this once partitionable device support is introduced for vfio devices.
-	if featuregates.Enabled(featuregates.PassthroughSupport) {
+	// With VGPUSupport the partitionable publish path replaces sibling
+	// removal: exclusivity between vfio/gpu and vgpu partitions is provided by
+	// the shared CounterSet (full consumption) plus compatibility groups.
+	if featuregates.Enabled(featuregates.PassthroughSupport) && !featuregates.Enabled(featuregates.VGPUSupport) {
 		for _, device := range preparedDevices.GetDevices() {
 			allocatableDevice := s.perGPUAllocatable.GetAllocatableDevice(device.DeviceName)
 			if allocatableDevice == nil {
@@ -543,7 +546,8 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimRef kubeletplugin.Name
 	}
 
 	// TODO: Remove this once partitionable device support is introduced for vfio devices.
-	if featuregates.Enabled(featuregates.PassthroughSupport) {
+	// See Prepare: sibling rediscovery only applies to the legacy publish path.
+	if featuregates.Enabled(featuregates.PassthroughSupport) && !featuregates.Enabled(featuregates.VGPUSupport) {
 		for _, device := range pc.PreparedDevices.GetDevices() {
 			allocatableDevice := s.perGPUAllocatable.GetAllocatableDevice(device.DeviceName)
 			if allocatableDevice == nil {
@@ -1369,8 +1373,8 @@ func (s *DeviceState) applyVgpuDeviceConfig(config *configapi.VgpuDeviceConfig, 
 		if config.Profile != "" && config.Profile != partition.Profile.Name {
 			return nil, fmt.Errorf("config profile %q does not match profile %q of allocated device %q", config.Profile, partition.Profile.Name, r.Device)
 		}
-		if config.TypeID != nil && uint32(*config.TypeID) != partition.Profile.TypeID {
-			return nil, fmt.Errorf("config typeID %d does not match type ID %d of allocated device %q", *config.TypeID, partition.Profile.TypeID, r.Device)
+		if config.ProfileID != nil && uint32(*config.ProfileID) != partition.Profile.ProfileID {
+			return nil, fmt.Errorf("config profileID %d does not match profile ID %d of allocated device %q", *config.ProfileID, partition.Profile.ProfileID, r.Device)
 		}
 	}
 

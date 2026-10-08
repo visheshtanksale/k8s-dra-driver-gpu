@@ -60,7 +60,7 @@ This matches Dynamic MIG’s publish path, adds the missing exclusivity predicat
 
 1. Advertise vGPU via **partitionable devices**: SharedCounters + partition `devices[]` under driver `gpu.nvidia.com`.
 2. Ship DeviceClass `vgpu.gpu.nvidia.com` selecting `type == vgpu` partitions.
-3. Allow optional opaque **`VgpuDeviceConfig`** for Prepare-time knobs (params, typeID overrides); profile **identity is primarily carried by the allocated partition device**.
+3. Allow optional opaque **`VgpuDeviceConfig`** for Prepare-time knobs (params, profileID overrides); profile **identity is primarily carried by the allocated partition device**.
 4. On **NodePrepareResources**, create the concrete vGPU (mdev and/or vendor-VFIO path), optional MIG GI/CI, CDI + Device Metadata for KubeVirt.
 5. On **NodeUnprepareResources**, destroy vGPU (then MIG if owned), update checkpoint; counters naturally free as claims release.
 6. Express **mode exclusivity** with **KEP-5963 compatibility groups** (vGPU profile families, MIG vs vGPU, optional gpu/vfio mode tags) so the scheduler rejects incompatible co-allocation before Prepare.
@@ -217,7 +217,7 @@ Pod / VMI
 
 #### 6.2.1 CounterSet per physical GPU
 
-For each vGPU-capable PF, publish one CounterSet named consistently with Dynamic MIG, e.g. `gpu-<minor>-counter-set` (RFC1123 via existing helpers).
+For each vGPU-capable PF, publish one CounterSet named `vgpu-<minor>-counter-set` (RFC1123 via existing helpers).
 
 **Baseline counters (time-sliced / non-MIG vGPU):**
 
@@ -253,9 +253,9 @@ For each vGPU-capable PF, publish one CounterSet named consistently with Dynamic
 Enumerate **abstract** devices **before** creation:
 
 ```text
-name: vgpu-gpu-<minor>-<profileSlug>-<slot>
+name: vgpu-gpu-<minor>-<shortProfileName>-<slot>
 # MIG-backed example:
-# vgpu-gpu-<minor>-<profileSlug>-p<placementStart>
+# vgpu-gpu-<minor>-<shortProfileName>-p<placementStart>
 ```
 
 Required attributes (bare keys in slice; CEL via `gpu.nvidia.com`):
@@ -264,18 +264,17 @@ Required attributes (bare keys in slice; CEL via `gpu.nvidia.com`):
 | --- | --- |
 | `type` | `vgpu` |
 | `profile` | Full vGPU type name (e.g. `NVIDIA L40S-12Q`) |
-| `profileSlug` | Stable short id for device names |
+| `shortProfileName` | Stable short id for device names |
 | `slot` | Integer 0..maxInstances-1 (non-MIG) |
 | `uuid` | Parent GPU UUID |
 | `productName` | PF product |
 | `resource.kubernetes.io/pciBusID` | PF BDF |
-| `vgpuFramework` | `mdev` \| `vdev` |
-| `sriovCapable` | bool |
-| `typeID` | int (optional attr if useful for CEL; also in config) |
+| `vgpuFramework` | `mdev` \| `vf` |
+| `profileID` | int (optional attr if useful for CEL; also in config) |
 
 MIG-backed extras: `migProfile`, `placementStart`, `placementSize`, `gpuProfileId`, `computeProfileId`.
 
-Each device sets `consumesCounters` → parent `gpu-<minor>-counter-set`.
+Each device sets `consumesCounters` → parent `vgpu-<minor>-counter-set`.
 
 **Do not** put live mdev UUIDs or VF PCIs in the advertised device **name**. Those appear only after Prepare in checkpoint/CDI/metadata.
 
@@ -318,7 +317,7 @@ Groups are **opaque** to Kubernetes; convention for this driver only:
 
 | Device kind | `compatibilityGroups` on PF CounterSet | Rationale |
 | --- | --- | --- |
-| Non-MIG vGPU slots of one exclusive family | `["vgpu-<profileSlug>"]` e.g. `["vgpu-12q"]` | Same family packs; other families blocked |
+| Non-MIG vGPU slots of one exclusive family | `["vgpu-<shortProfileName>"]` e.g. `["vgpu-12q"]` | Same family packs; other families blocked |
 | If multiple families may legally mix (rare) | shared super-group e.g. `["vgpu"]` on all | Document carefully |
 | Container Dynamic/static MIG partition | `["mig"]` | Disjoint from vGPU families |
 | MIG-**backed** vGPU partition | `["vgpu-mig"]` or `["vgpu-mig-<slug>"]` | Disjoint from pure `mig` and pure time-sliced `vgpu-*` unless hardware allows |
@@ -370,7 +369,7 @@ spec:
     generation: 7
     resourceSliceCount: 2
   sharedCounters:
-  - name: gpu-0-counter-set
+  - name: vgpu-0-counter-set
     counters:
       framebuffer: { value: 48Gi }
 ```
@@ -398,7 +397,7 @@ spec:
       productName: { string: NVIDIA L40S }
       resource.kubernetes.io/pciBusID: { string: "0000:41:00.0" }
     consumesCounters:
-    - counterSet: gpu-0-counter-set
+    - counterSet: vgpu-0-counter-set
       counters:
         framebuffer: { value: 48Gi }
       compatibilityGroups: ["gpu-full"]
@@ -410,7 +409,7 @@ spec:
       uuid: { string: GPU-aaaa }
       resource.kubernetes.io/pciBusID: { string: "0000:41:00.0" }
     consumesCounters:
-    - counterSet: gpu-0-counter-set
+    - counterSet: vgpu-0-counter-set
       counters:
         framebuffer: { value: 48Gi }
       compatibilityGroups: ["vfio"]
@@ -420,15 +419,14 @@ spec:
     attributes:
       type: { string: vgpu }
       profile: { string: "NVIDIA L40S-12Q" }
-      profileSlug: { string: "12q" }
+      shortProfileName: { string: "12q" }
       slot: { int: 0 }
       uuid: { string: GPU-aaaa }
       productName: { string: NVIDIA L40S }
       resource.kubernetes.io/pciBusID: { string: "0000:41:00.0" }
       vgpuFramework: { string: mdev }
-      sriovCapable: { bool: true }
     consumesCounters:
-    - counterSet: gpu-0-counter-set
+    - counterSet: vgpu-0-counter-set
       counters:
         framebuffer: { value: 12Gi }
       compatibilityGroups: ["vgpu-12q"]
@@ -436,7 +434,7 @@ spec:
   - name: vgpu-gpu-0-12q-1
     attributes: { type: { string: vgpu }, profile: { string: "NVIDIA L40S-12Q" }, slot: { int: 1 }, ... }
     consumesCounters:
-    - counterSet: gpu-0-counter-set
+    - counterSet: vgpu-0-counter-set
       counters:
         framebuffer: { value: 12Gi }
       compatibilityGroups: ["vgpu-12q"]
@@ -447,12 +445,12 @@ spec:
     attributes:
       type: { string: vgpu }
       profile: { string: "NVIDIA L40S-24Q" }
-      profileSlug: { string: "24q" }
+      shortProfileName: { string: "24q" }
       slot: { int: 0 }
       uuid: { string: GPU-aaaa }
       vgpuFramework: { string: mdev }
     consumesCounters:
-    - counterSet: gpu-0-counter-set
+    - counterSet: vgpu-0-counter-set
       counters:
         framebuffer: { value: 24Gi }
       compatibilityGroups: ["vgpu-24q"]
@@ -484,7 +482,7 @@ Reuse Dynamic MIG counter dimensions; device type remains `vgpu`:
     uuid: { string: GPU-... }
     vgpuFramework: { string: mdev }
   consumesCounters:
-  - counterSet: gpu-0-counter-set
+  - counterSet: vgpu-0-counter-set
     counters:
       memory: { value: 5Gi }
       multiprocessors: { value: "14" }
@@ -611,7 +609,7 @@ type VgpuDeviceConfig struct {
     // If set, Prepare MUST verify equality with device attribute.
     Profile string `json:"profile,omitempty"`
 
-    TypeID *int `json:"typeID,omitempty"`
+    ProfileID *int `json:"profileID,omitempty"`
 
     Mig *VgpuMigConfig `json:"mig,omitempty"` // optional override; partition usually encodes MIG
 
@@ -635,7 +633,7 @@ On plugin start (and when republishing after mode changes):
 1. Enumerate PFs via existing `deviceLib` / NVML.
 2. If `VGPUSupport`:
    - Detect framework (`mdev` / `vdev`).
-   - Load supported types (NVML + sysfs) merged with **admin catalog** (TypeID, maxInstances, FB cost, MIG flags).
+   - Load supported types (NVML + sysfs) merged with **admin catalog** (ProfileID, maxInstances, FB cost, MIG flags).
    - Skip PFs unsuitable (no vGPU Manager types, wrong driver bind, etc.).
 3. Build per-PF CounterSet from PF FB + policy.
 4. For each profile: emit `maxInstances` slot devices (or MIG placements × profile).
@@ -678,12 +676,12 @@ vgpu:
     # Only these profiles appear in ResourceSlices for this model
     profiles:
     - name: "NVIDIA L40S-12Q"
-      typeID: 1177
+      profileID: 1177
       maxInstances: 4            # advertise at most 4 slots (≤ hardware max)
       framebuffer: 12Gi          # counter cost
       enabled: true
     - name: "NVIDIA L40S-24Q"
-      typeID: 1178
+      profileID: 1178
       maxInstances: 2
       framebuffer: 24Gi
       enabled: true
@@ -846,7 +844,7 @@ Success criterion: KubeVirt VMI reaches Running with guest vGPU visible.
 type PreparedVgpuDevice struct {
     Info     *VgpuPartitionInfo
     Device   *CheckpointedDevice
-    Concrete *VgpuConcrete // mdev UUID | vfPCI + typeID + optional GI id
+    Concrete *VgpuConcrete // mdev UUID | vfPCI + profileID + optional GI id
 }
 ```
 
@@ -864,7 +862,7 @@ Optional later: scoring attributes if scheduler policies need “prefer denser P
 
 ### 6.11 SR-IOV
 
-- Attribute `sriovCapable` on partitions.
+- Framework attribute `vgpuFramework` (`mdev`|`vf`) on partitions, derived from NVML device.GetHostVgpuMode.
 - Prepare enables/slices VFs when framework needs them (dynamic DP `createVF` parity).
 - Whole-PF VFIO path keeps `verifyDisabledVFs`.
 - Admin pre-slice still supported.
@@ -945,7 +943,7 @@ Ship `deviceclass-vgpu-gpu.yaml` when GPUs enabled (class present even if gate o
 | Unit | Counter costs; **group intersection matrix**; strip groups when gate off; name stability; config validate; checkpoint |
 | Integration | Fake counters+devices+groups; scheduler mock rejects mig+vgpu and 12q+24q; allows 12q+12q |
 | E2E lab | Multi-VM same profile pack; **cross-family Pending (not prepare fail)**; full gpu/vfio blocked; unprepare restores; plugin restart; gate-off republish without groups |
-| Negative | Oversubscribe FB; missing vGPU Manager; wrong typeID; MIG create fail rollback; groups declared with gate off (must not publish) |
+| Negative | Oversubscribe FB; missing vGPU Manager; wrong profileID; MIG create fail rollback; groups declared with gate off (must not publish) |
 | Regression | Dynamic MIG + VFIO demos with `VGPUSupport=false` |
 
 ---
@@ -1056,4 +1054,5 @@ Using a shared counter of capacity 1 decremented by every device in a family **c
 | 2026-09-01 | Draft rev | **Pivot to partitionable devices (KEP-4815) as sole resource model**; ResourceSlice/claim examples; Dynamic MIG alignment |
 | 2026-09-10 | Draft rev | **Integrate KEP-5963 Device Compatibility Groups** for MIG↔vGPU and vGPU family exclusivity; gate skew rules; reject token-counter approach |
 | 2026-09-30 | Draft rev | Implementation landed (advertisement + mdev/vdev lifecycle). Deltas vs. this document: `VgpuDeviceConfig` ships without the `mig`/`sriov` sub-structs (MIG-backed and DynamicSRIOV remain Phase 2+); no `vgpuInstances` counter (slot enumeration is the bound; counter keys are lowercase RFC 1123 so camelCase was invalid anyway); profile allowlist is a simple `--vgpu-profiles` comma list rather than the §6.5.1 catalog file; concrete-device crash safety uses marker files under the plugin directory in addition to the checkpoint; `DeviceMetadata` gate now also satisfied by `VGPUSupport` (not only `PassthroughSupport`). |
-| 2026-09-30 | Draft rev | Aligned vdev prepare with the NVIDIA vGPU 20.0 user guide: per-VF attributes live in `<VF>/nvidia/` (`current_vgpu_type`, `creatable_vgpu_types`); creatability is validated before the write; VF enablement is the administrator's job via `sriov-manage`; SR-IOV-mdev hosts create per-VF mdevs (one per VF); framework detection probes `<VF>/nvidia/current_vgpu_type`. |
+| 2026-09-30 | Draft rev | Aligned vdev prepare with the NVIDIA vGPU 20.0 user guide: per-VF attributes live in `<VF>/nvidia/` (`current_vgpu_type`, `creatable_vgpu_types`); creatability is validated before the write; VF enablement is the administrator's job via `sriov-manage`; SR-IOV-mdev hosts create per-VF mdevs (one per VF). |
+| 2026-10-07 | Draft rev | Framework detection via NVML `nvmlDeviceGetHostVgpuMode` (`HOST_VGPU_MODE_SRIOV` ⇒ vendor-VFIO framework, attr value `vf`; otherwise `mdev`) — replaces the earlier sysfs VF-attribute probing; mdev lifecycle delegates to `go-nvlib/pkg/nvmdev`. |

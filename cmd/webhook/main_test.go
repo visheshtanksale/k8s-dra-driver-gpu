@@ -120,9 +120,9 @@ func TestResourceClaimValidatingWebhook(t *testing.T) {
 				resourceClaimWithVgpuConfig(
 					resourceClaimResourceV1Beta1,
 					&configapi.VgpuDeviceConfig{
-						Profile: "NVIDIA L40S-12Q",
-						TypeID:  ptr.To(1177),
-						Params:  map[string]string{"frame_rate_limiter": "0"},
+						Profile:   "NVIDIA L40S-12Q",
+						ProfileID: ptr.To(1177),
+						Params:    map[string]string{"frame_rate_limiter": "0"},
 					},
 				),
 			),
@@ -133,12 +133,12 @@ func TestResourceClaimValidatingWebhook(t *testing.T) {
 				resourceClaimWithVgpuConfig(
 					resourceClaimResourceV1Beta1,
 					&configapi.VgpuDeviceConfig{
-						TypeID: ptr.To(-1),
+						ProfileID: ptr.To(-1),
 					},
 				),
 			),
 			expectedAllowed: false,
-			expectedMessage: "1 configs failed to validate: object at spec.devices.config[0].opaque.parameters is invalid: typeID must be non-negative, got -1",
+			expectedMessage: "1 configs failed to validate: object at spec.devices.config[0].opaque.parameters is invalid: profileID must be non-negative, got -1",
 		},
 		"valid ComputeDomainDaemonConfig in ResourceClaim": {
 			admissionReview: admissionReviewWithObject(

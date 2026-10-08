@@ -272,6 +272,8 @@ func (d *driver) generateSplitResourceSlices(nodeName string) resourceslice.Driv
 					gpuInfo = device.MigDynamic.Parent
 				case device.Vgpu != nil:
 					gpuInfo = device.Vgpu.Parent
+				case device.Vfio != nil:
+					gpuInfo = device.Vfio.parent
 				}
 			}
 
@@ -333,6 +335,8 @@ func (d *driver) generateCombinedResourceSlices(nodeName string) resourceslice.D
 					gpuInfo = device.MigDynamic.Parent
 				case device.Vgpu != nil:
 					gpuInfo = device.Vgpu.Parent
+				case device.Vfio != nil:
+					gpuInfo = device.Vfio.parent
 				}
 			}
 

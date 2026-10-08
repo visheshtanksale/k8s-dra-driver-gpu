@@ -540,8 +540,8 @@ func (in *VfioDeviceConfig) DeepCopyObject() runtime.Object {
 func (in *VgpuDeviceConfig) DeepCopyInto(out *VgpuDeviceConfig) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
-	if in.TypeID != nil {
-		in, out := &in.TypeID, &out.TypeID
+	if in.ProfileID != nil {
+		in, out := &in.ProfileID, &out.ProfileID
 		*out = new(int)
 		**out = **in
 	}

@@ -172,6 +172,50 @@ func TestPartMigSpecGetDevice(t *testing.T) {
 	}
 }
 
+// VFIO devices are representable on the partitionable publish path when the
+// parent GPU also advertises vGPU partitions: whole-PF counter consumption
+// plus the "vfio" group (FR-3b). Without vGPU partitions on the parent,
+// the device carries no counter consumption.
+func TestPartVfioGetDevice(t *testing.T) {
+	t.Run("no vGPU partitions: plain device, no counter consumption", func(t *testing.T) {
+		vfio := &VfioDeviceInfo{
+			UUID:        "GPU-a",
+			productName: "NVIDIA A100",
+			PciBusID:    "0000:01:00.0",
+			parent:      newPartTestGpu(nil, 0),
+		}
+		dev := vfio.PartGetDevice()
+		require.Equal(t, VfioDeviceType, *dev.Attributes["type"].StringValue)
+		require.Nil(t, dev.ConsumesCounters)
+	})
+
+	t.Run("vGPU parent: full counter consumption and vfio group", func(t *testing.T) {
+		gpu := newPartTestGpu(nil, 0)
+		gpu.memoryBytes = ptr.To(uint64(48 << 30))
+		gpu.vgpuProfiles = []*VgpuProfileSpec{
+			{Name: "GRID A100-40C", ProfileID: 473, FramebufferBytes: 40 << 30, MaxInstances: 1},
+		}
+		vfio := &VfioDeviceInfo{
+			UUID:        "GPU-a",
+			productName: "NVIDIA A100",
+			PciBusID:    "0000:01:00.0",
+			parent:      gpu,
+		}
+
+		setCompatibilityGroupsGate(t, false)
+
+		dev := vfio.PartGetDevice()
+		require.Len(t, dev.ConsumesCounters, 1)
+		require.Equal(t, gpu.VgpuSharedCounterSetName(), dev.ConsumesCounters[0].CounterSet)
+		require.Equal(t, int64(48<<30), counterValue(t, dev.ConsumesCounters[0].Counters, vgpuFramebufferCounterName))
+		require.Empty(t, dev.ConsumesCounters[0].CompatibilityGroups)
+
+		setCompatibilityGroupsGate(t, true)
+		dev = vfio.PartGetDevice()
+		require.Equal(t, []string{vfioCompatibilityGroup}, dev.ConsumesCounters[0].CompatibilityGroups)
+	})
+}
+
 func TestPartGpuInfoGetDevice(t *testing.T) {
 	gpu := newPartTestGpu(PartCapacityMap{"multiprocessors": intcap(132)}, 2)
 
@@ -216,8 +260,6 @@ func TestPartAllocatableDeviceGetDevice(t *testing.T) {
 	}{
 		{"static MIG", &AllocatableDevice{MigStatic: &MigDeviceInfo{}},
 			"PartGetDevice() called for MigStaticDeviceType"},
-		{"VFIO", &AllocatableDevice{Vfio: &VfioDeviceInfo{}},
-			"not yet implemented"},
 		{"an unset device", &AllocatableDevice{},
 			"unexpected type for AllocatableDevice"},
 	} {

@@ -53,7 +53,7 @@ func (h *vgpuCDIHandler) GetDeviceSpecs(concrete *VgpuConcrete) ([]cdispec.Devic
 				},
 			},
 		}}, nil
-	case vgpuFrameworkVdev:
+	case vgpuFrameworkVf:
 		return []cdispec.Device{{
 			ContainerEdits: cdispec.ContainerEdits{},
 		}}, nil

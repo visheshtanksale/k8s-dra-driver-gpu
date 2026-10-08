@@ -39,9 +39,9 @@ type VgpuDeviceConfig struct {
 	// (CEL on the device `profile` attribute) is the preferred mechanism.
 	Profile string `json:"profile,omitempty"`
 
-	// TypeID optionally pins the numeric vGPU type ID. When set, it must
+	// ProfileID optionally pins the numeric vGPU type ID. When set, it must
 	// match the type ID of every allocated device this config applies to.
-	TypeID *int `json:"typeID,omitempty"`
+	ProfileID *int `json:"profileID,omitempty"`
 
 	// Params are opaque host vGPU parameters (vgpu_params), applied to the
 	// concrete device created at Prepare time, e.g. frame rate limiter or
@@ -71,8 +71,8 @@ func (c *VgpuDeviceConfig) Normalize() error {
 
 // Validate ensures that VgpuDeviceConfig has a valid set of values.
 func (c *VgpuDeviceConfig) Validate() error {
-	if c.TypeID != nil && *c.TypeID < 0 {
-		return fmt.Errorf("typeID must be non-negative, got %d", *c.TypeID)
+	if c.ProfileID != nil && *c.ProfileID < 0 {
+		return fmt.Errorf("profileID must be non-negative, got %d", *c.ProfileID)
 	}
 	for key := range c.Params {
 		if key == "" {
