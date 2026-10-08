@@ -189,8 +189,8 @@ address; those are produced at Prepare time.
 - attributes:
     profile:
       string: NVIDIA L40S-12Q       # full vGPU type name
-    profileSlug:
-      string: 12q                   # short, stable ID used in the device name
+    shortProfileName:
+      string: 12q                   # short, stable ID: derived from the profile name; keys the device name slot and the "vgpu-<shortProfileName>" compatibility group
     productName:
       string: NVIDIA L40S           # inherited from the parent GPU
     resource.kubernetes.io/pciBusID:
@@ -199,18 +199,16 @@ address; those are produced at Prepare time.
       string: pci0000:64            # inherited from the parent GPU
     slot:
       int: 2                        # slot index within this profile family (0..maxInstances-1)
-    sriovCapable:
-      bool: true                    # whether the parent PCI function is SR-IOV capable
     type:
       string: vgpu                  # device kind
-    typeID:
+    profileID:
       int: 1177                     # numeric vGPU type ID reported by NVML
     uuid:
       string: GPU-2fa81118-5a5f-aa66-7660-471eed407181  # parent GPU UUID
     vgpuFramework:
-      string: mdev                  # host management framework: mdev or vdev
+      string: mdev                  # host management framework: mdev or vf
   consumesCounters:
-  - counterSet: gpu-0-counter-set
+  - counterSet: vgpu-0-counter-set
     compatibilityGroups:
     - vgpu-12q                      # only when the DRADeviceCompatibilityGroups gate is on
     counters:

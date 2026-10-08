@@ -18,10 +18,10 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
@@ -47,9 +47,9 @@ const (
 	// slots of different families are not.
 	vgpuCompatibilityGroupPrefix = "vgpu-"
 
-	// Full-GPU devices (and whole-PF VFIO devices, once representable in the
-	// partitionable publish path) carry these disjoint-from-everything groups.
-	// Capacity exclusion is provided on top by consuming the entire CounterSet.
+	// Full-GPU and whole-PF VFIO devices carry these disjoint-from-everything
+	// groups. Capacity exclusion is provided on top by consuming the entire
+	// CounterSet.
 	gpuFullCompatibilityGroup = "gpu-full"
 	vfioCompatibilityGroup    = "vfio"
 
@@ -63,7 +63,7 @@ const (
 // (design: docs/design/vgpu-support.md, FR-8).
 const (
 	vgpuFrameworkMdev = "mdev"
-	vgpuFrameworkVdev = "vdev"
+	vgpuFrameworkVf   = "vf"
 )
 
 // VgpuProfileSpec describes one vGPU profile (type) advertised on a physical
@@ -73,13 +73,25 @@ type VgpuProfileSpec struct {
 	// Full vGPU type name as reported by NVML, e.g. "NVIDIA L40S-12Q".
 	Name string
 	// Numeric vGPU type ID as reported by NVML.
-	TypeID uint32
+	ProfileID uint32
 	// Framebuffer budget this profile consumes from the parent GPU, in bytes.
 	FramebufferBytes uint64
 	// Number of slot partitions advertised for this profile. Equals the
 	// hardware maximum instance count until admin-side caps are implemented
 	// (docs/design/vgpu-support.md, section 6.5.1, strategy 2).
 	MaxInstances int
+}
+
+// vgpuMdevTypeName maps a full NVML vGPU type name (e.g. "GRID A100-40C",
+// "NVIDIA L40S-12Q") to the short mdev type name the NVIDIA vGPU Manager
+// registers in sysfs ("A100-40C", "L40S-12Q"). Mirrors nvmdev's convention
+// of taking the last space-separated token.
+func vgpuMdevTypeName(profile string) string {
+	fields := strings.Fields(profile)
+	if len(fields) == 0 {
+		return profile
+	}
+	return fields[len(fields)-1]
 }
 
 // Slug returns a stable, RFC1123-compliant short identifier for the profile,
@@ -107,10 +119,8 @@ type VgpuPartitionInfo struct {
 	// 0..MaxInstances-1. It makes each abstract partition individually
 	// allocatable; it does not imply placement on hardware.
 	Slot int
-	// Framework is "mdev" or "vdev" (vgpuFramework* constants).
+	// Framework is "mdev" or "vf" (vgpuFramework* constants).
 	Framework string
-	// SriovCapable reports whether the parent PCI function is SR-IOV capable.
-	SriovCapable bool
 }
 
 func (i *VgpuPartitionInfo) CanonicalName() string {
@@ -125,7 +135,11 @@ func (i *VgpuPartitionInfo) Attributes() map[resourceapi.QualifiedName]resourcea
 		"profile": {
 			StringValue: ptr.To(i.Profile.Name),
 		},
-		"profileSlug": {
+		// shortProfileName is the last hyphen-separated token of the profile
+		// name, lowercased and sanitized (stable across restarts). It keys
+		// slot device names (vgpu-gpu-<minor>-<shortProfileName>-<slot>) and
+		// the "vgpu-<shortProfileName>" compatibility group.
+		"shortProfileName": {
 			StringValue: ptr.To(i.Profile.Slug()),
 		},
 		"slot": {
@@ -141,11 +155,8 @@ func (i *VgpuPartitionInfo) Attributes() map[resourceapi.QualifiedName]resourcea
 		"vgpuFramework": {
 			StringValue: ptr.To(i.Framework),
 		},
-		"sriovCapable": {
-			BoolValue: ptr.To(i.SriovCapable),
-		},
-		"typeID": {
-			IntValue: ptr.To(int64(i.Profile.TypeID)),
+		"profileID": {
+			IntValue: ptr.To(int64(i.Profile.ProfileID)),
 		},
 	}
 
@@ -174,7 +185,7 @@ func (i *VgpuPartitionInfo) compatibilityGroup() string {
 // entirely (docs/design/vgpu-support.md, section 6.1.1 skew rule 2).
 func (i *VgpuPartitionInfo) PartConsumesCounters() []resourceapi.DeviceCounterConsumption {
 	consumption := resourceapi.DeviceCounterConsumption{
-		CounterSet: i.Parent.GetSharedCounterSetName(),
+		CounterSet: i.Parent.VgpuSharedCounterSetName(),
 		Counters: map[string]resourceapi.Counter{
 			vgpuFramebufferCounterName: {Value: *resource.NewQuantity(int64(i.Profile.FramebufferBytes), resource.BinarySI)},
 		},
@@ -206,32 +217,25 @@ func parseVgpuProfileAllowlist(raw string) map[string]bool {
 	return allowed
 }
 
-// detectVgpuFramework determines whether the host manages vGPU devices for
-// the physical function identified by pciBusID through the mediated
-// framework ("mdev") or the vendor-specific VFIO framework ("vdev"), as
-// documented for NVIDIA vGPU software on KVM hypervisors. On vdev hosts the
-// vGPU manager exposes vgpu_type attributes under each VF's nvidia/
-// directory (<VF>/nvidia/current_vgpu_type); on mdev hosts it exposes
-// mdev_supported_types (legacy GPUs: on the PF; SR-IOV GPUs with mdev: on
-// the VFs). Best-effort only: absence of everything does not fail
-// advertisement, since the framework is exercised at Prepare time.
-func detectVgpuFramework(sysfsRoot string, pciBusID string) (framework string, sriovCapable bool) {
-	deviceDir := filepath.Join(sysfsRoot, "sys", "bus", "pci", "devices", pciBusID)
-
-	if _, err := os.Stat(filepath.Join(deviceDir, "sriov_totalvfs")); err != nil {
-		// No SR-IOV: legacy GPU; only mdev exists.
-		return vgpuFrameworkMdev, false
+// detectVgpuFramework determines whether the host manages vGPU devices
+// through the mediated framework ("mdev") or the vendor-specific VFIO
+// framework ("vf"), using NVML's device.GetHostVgpuMode
+// (nvmlHostVgpuMode_t): NVML_HOST_VGPU_MODE_SRIOV means the vGPU Manager
+// runs this GPU in SR-IOV mode, whose Prepare flow programs a VF's type via
+// the vendor VFIO attributes; otherwise the manager uses the mediated
+// framework. Calls pass in the NVML getter directly so detection is
+// testable without a full nvml.Device mock. Errors (device does not
+// support host vGPUs) fall back to "mdev", since framework is only
+// exercised at Prepare time.
+func detectVgpuFramework(getHostVgpuMode func() (nvml.HostVgpuMode, nvml.Return)) (framework string) {
+	mode, ret := getHostVgpuMode()
+	if ret != nvml.SUCCESS {
+		return vgpuFrameworkMdev
 	}
-
-	// The vendor-specific VFIO framework (vGPU 17+ style) exposes
-	// current_vgpu_type per VF inside the VF's nvidia/ directory. It is only
-	// meaningful once VFs are enabled, so check any existing VF.
-	for _, vf := range vgpuVFsOfPF(deviceDir) {
-		if _, err := os.Stat(filepath.Join(vgpuVFNVidiaDir(sysfsRoot, vf), vgpuCurrentTypeFile)); err == nil {
-			return vgpuFrameworkVdev, true
-		}
+	if mode == nvml.HOST_VGPU_MODE_SRIOV {
+		return vgpuFrameworkVf
 	}
-	return vgpuFrameworkMdev, true
+	return vgpuFrameworkMdev
 }
 
 // vgpuVFsOfPF returns the PCI bus IDs of the currently enabled VFs of the PF

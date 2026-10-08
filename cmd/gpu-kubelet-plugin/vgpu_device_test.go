@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -46,7 +47,7 @@ func newMdevTestPartition() *VgpuPartitionInfo {
 		},
 		Profile: &VgpuProfileSpec{
 			Name:             "NVIDIA L40S-12Q",
-			TypeID:           vgpuTestTypeID,
+			ProfileID:        vgpuTestTypeID,
 			FramebufferBytes: 12 << 30,
 			MaxInstances:     4,
 		},
@@ -64,6 +65,7 @@ func setupFakeMdevHost(t *testing.T, availableInstances string) string {
 	typeDir := filepath.Join(root, "sys", "bus", "pci", "devices", vgpuTestPCIBusID,
 		"mdev_supported_types", vgpuMdevSysfsTypeName(vgpuTestTypeID))
 	require.NoError(t, os.MkdirAll(typeDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(typeDir, "name"), []byte("NVIDIA L40S-12Q"), 0644))
 	require.NoError(t, os.WriteFile(filepath.Join(typeDir, "available_instances"), []byte(availableInstances), 0644))
 	require.NoError(t, os.WriteFile(filepath.Join(typeDir, "create"), nil, 0644))
 
@@ -76,13 +78,102 @@ func setupFakeMdevHost(t *testing.T, availableInstances string) string {
 	return root
 }
 
-func vgpuTestDeviceLib(sysfsRoot string) *deviceLib {
-	return &deviceLib{sysfsRoot: sysfsRoot}
+// vgpuTestDeviceLib builds a deviceLib for vGPU unit tests: fake mdev store
+// on the given sysfs root and a host root with the nvidia_vgpu_vfio module
+// "loaded" (directory present), like a vGPU Manager host.
+// vgpuTestDeviceLib builds a deviceLib for vGPU unit tests: fake mdev store
+// on the given sysfs root and a host root with the nvidia_vgpu_vfio module
+// "loaded" (directory present), like a vGPU Manager host.
+func vgpuTestDeviceLib(t *testing.T, sysfsRoot string) *deviceLib {
+	t.Helper()
+	hostRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(hostRoot, "sys", "module", nvidiaVgpuVfioModule), 0755))
+	return &deviceLib{
+		sysfsRoot: sysfsRoot,
+		hostRoot:  hostRoot,
+		vgpuMdev:  newFakeSysfsMdevStore(sysfsRoot),
+	}
+}
+
+// fakeSysfsMdevStore implements vgpuMdevStore against a tempfs sysfs tree,
+// providing the same fixture coverage as the real nvmdev-backed store gets
+// on real hardware.
+type fakeSysfsMdevStore struct {
+	sysfsRoot string
+}
+
+func newFakeSysfsMdevStore(sysfsRoot string) *fakeSysfsMdevStore {
+	return &fakeSysfsMdevStore{sysfsRoot: sysfsRoot}
+}
+
+// parentsWithAvailability mirrors the NVIDIA vGPU sysfs contract (and
+// nvmdev's behavior): a parent (PF or VF) advertises types via
+// mdev_supported_types/nvidia-<profileID>/, whose `name` file holds the full
+// type name; availability is read from available_instances. Parents not
+// advertising the type are reported with AvailableInstances = -1.
+func (s *fakeSysfsMdevStore) ParentsWithAvailability(pciBusID string, mdevType string) ([]vgpuMdevParent, error) {
+	pfDir := sysfsPciDeviceDir(s.sysfsRoot, pciBusID)
+
+	var out []vgpuMdevParent
+	check := func(address string, dir string) {
+		nameFiles, err := filepath.Glob(filepath.Join(dir, "mdev_supported_types", "nvidia-*", "name"))
+		if err != nil || len(nameFiles) == 0 {
+			return
+		}
+		avail := -1
+		for _, nameFile := range nameFiles {
+			data, err := os.ReadFile(nameFile)
+			if err != nil || vgpuMdevTypeName(string(data)) != mdevType {
+				continue
+			}
+			data, err = os.ReadFile(filepath.Join(filepath.Dir(nameFile), "available_instances"))
+			if err != nil {
+				continue
+			}
+			if v, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+				avail = v
+			}
+		}
+		out = append(out, vgpuMdevParent{Address: address, AvailableInstances: avail})
+	}
+
+	check(pciBusID, pfDir)
+	for _, vf := range vgpuVFsOfPF(pfDir) {
+		check(vf, sysfsPciDeviceDir(s.sysfsRoot, vf))
+	}
+	return out, nil
+}
+
+func (s *fakeSysfsMdevStore) CreateMdev(parentAddress string, mdevType string, devUUID string) error {
+	nameFiles, err := filepath.Glob(filepath.Join(sysfsPciDeviceDir(s.sysfsRoot, parentAddress), "mdev_supported_types", "nvidia-*", "name"))
+	if err != nil {
+		return err
+	}
+	for _, nameFile := range nameFiles {
+		data, err := os.ReadFile(nameFile)
+		if err != nil || vgpuMdevTypeName(string(data)) != mdevType {
+			continue
+		}
+		// The fake kernel write seam materializes the instance dir on write.
+		return vgpuWriteFile(filepath.Join(filepath.Dir(nameFile), "create"), []byte(devUUID), 0200)
+	}
+	return fmt.Errorf("unable to create mdev %s: mdev not supported by parent device %s", mdevType, parentAddress)
+}
+
+func (s *fakeSysfsMdevStore) DeleteMdev(devUUID string) error {
+	removePath := filepath.Join(sysfsMdevDeviceDir(s.sysfsRoot, devUUID), "remove")
+	if _, err := os.Lstat(removePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return vgpuWriteFile(removePath, []byte("1"), 0200)
 }
 
 func TestCreateVgpuDeviceMdev(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
 	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), map[string]string{
 		"frame_rate_limiter": "0",
@@ -91,7 +182,7 @@ func TestCreateVgpuDeviceMdev(t *testing.T) {
 
 	if assert.NotNil(t, concrete) {
 		assert.Equal(t, vgpuFrameworkMdev, concrete.Framework)
-		assert.Equal(t, uint32(vgpuTestTypeID), concrete.TypeID)
+		assert.Equal(t, uint32(vgpuTestTypeID), concrete.ProfileID)
 		assert.Equal(t, "NVIDIA L40S-12Q", concrete.Profile)
 		assert.Equal(t, vgpuTestPCIBusID, concrete.ParentPCIBusID)
 		assert.NotEmpty(t, concrete.MdevUUID)
@@ -121,6 +212,7 @@ func TestCreateVgpuDeviceMdevOnFreeVF(t *testing.T) {
 	for i, vf := range []string{freeVF, busyVF} {
 		typeDir := filepath.Join(devicesDir, vf, "mdev_supported_types", vgpuMdevSysfsTypeName(vgpuTestTypeID))
 		require.NoError(t, os.MkdirAll(typeDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(typeDir, "name"), []byte("NVIDIA L40S-12Q"), 0644))
 		avail := "1"
 		if i == 1 {
 			avail = "0"
@@ -134,7 +226,7 @@ func TestCreateVgpuDeviceMdevOnFreeVF(t *testing.T) {
 	t.Cleanup(func() { vgpuWriteFile = origWrite })
 	vgpuWriteFile = fakeMdevKernelWrites(root, nil)
 
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
 	require.NoError(t, err)
 
@@ -182,20 +274,56 @@ func fakeMdevKernelWrites(root string, createdParams map[string][]string) func(s
 	}
 }
 
-func TestCreateVgpuDeviceMdevNoInstances(t *testing.T) {
-	root := setupFakeMdevHost(t, "0")
-	lib := vgpuTestDeviceLib(root)
+// Without the mediated-device kernel module, mdev creation must fail fast
+// with an actionable error instead of a bare mdev "type not found".
+func TestCreateVgpuDeviceMdevModuleMissing(t *testing.T) {
+	root := setupFakeMdevHost(t, "4")
+	lib := vgpuTestDeviceLib(t, root)
+
+	// Remove the fake nvidia_vgpu_vfio module dir: host has /sys/module but
+	// the module is not loaded.
+	hostRoot := lib.hostRoot
+	require.NoError(t, os.RemoveAll(filepath.Join(hostRoot, "sys", "module", nvidiaVgpuVfioModule)))
 
 	_, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
-	require.ErrorContains(t, err, "no available instances")
+	require.ErrorContains(t, err, nvidiaVgpuVfioModule+"\" is not loaded")
+}
+
+func TestVgpuVfioModuleDetection(t *testing.T) {
+	t.Run("loaded when directory present", func(t *testing.T) {
+		lib := vgpuTestDeviceLib(t, t.TempDir())
+		loaded, err := lib.isVgpuVfioModuleLoaded()
+		require.NoError(t, err)
+		require.True(t, loaded)
+	})
+
+	t.Run("not loaded when directory missing from existing /sys/module", func(t *testing.T) {
+		hostRoot := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(hostRoot, "sys", "module"), 0755))
+		lib := &deviceLib{hostRoot: hostRoot}
+		loaded, err := lib.isVgpuVfioModuleLoaded()
+		require.NoError(t, err)
+		require.False(t, loaded)
+	})
+
+}
+
+func TestCreateVgpuDeviceMdevNoInstances(t *testing.T) {
+	root := setupFakeMdevHost(t, "0")
+	lib := vgpuTestDeviceLib(t, root)
+
+	_, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
+	require.ErrorContains(t, err, "not found or busy on GPU")
 }
 
 func TestCreateVgpuDeviceMdevUnknownType(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
+	// The host advertises L40S-12Q; creating an unadvertised profile must
+	// fail before writing any sysfs "create" file.
 	partition := newMdevTestPartition()
-	partition.Profile.TypeID = 9999
+	partition.Profile.Name = "NVIDIA L40S-24Q"
 
 	_, err := lib.createVgpuDevice(partition, nil)
 	require.ErrorContains(t, err, "not found or busy on GPU")
@@ -203,7 +331,7 @@ func TestCreateVgpuDeviceMdevUnknownType(t *testing.T) {
 
 func TestDeleteVgpuDeviceMdev(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
 	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
 	require.NoError(t, err)
@@ -251,14 +379,14 @@ func setupFakeVdevHost(t *testing.T) (root string, freeVF string, busyVF string)
 
 func newVdevTestPartition() *VgpuPartitionInfo {
 	p := newMdevTestPartition()
-	p.Framework = vgpuFrameworkVdev
-	p.SriovCapable = true
+	p.Framework = vgpuFrameworkVf
+
 	return p
 }
 
 func TestCreateVgpuDeviceVdev(t *testing.T) {
 	root, freeVF, busyVF := setupFakeVdevHost(t)
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
 	concrete, err := lib.createVgpuDevice(newVdevTestPartition(), nil)
 	require.NoError(t, err)
@@ -280,10 +408,10 @@ func TestCreateVgpuDeviceVdev(t *testing.T) {
 // the VF's current_vgpu_type resets to 0).
 func TestCreateVgpuDeviceVdevUncreatableType(t *testing.T) {
 	root, freeVF, _ := setupFakeVdevHost(t)
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
 	partition := newVdevTestPartition()
-	partition.Profile.TypeID = 9999
+	partition.Profile.ProfileID = 9999
 
 	_, err := lib.createVgpuDevice(partition, nil)
 	require.ErrorContains(t, err, "no free VF")
@@ -295,7 +423,7 @@ func TestCreateVgpuDeviceVdevUncreatableType(t *testing.T) {
 
 func TestDeleteVgpuDeviceVdev(t *testing.T) {
 	root, _, _ := setupFakeVdevHost(t)
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
 	concrete, err := lib.createVgpuDevice(newVdevTestPartition(), nil)
 	require.NoError(t, err)
@@ -312,7 +440,7 @@ func TestDeleteVgpuDeviceVdev(t *testing.T) {
 
 func TestCreateVgpuDeviceVdevNoVFs(t *testing.T) {
 	root, _, _ := setupFakeVdevHost(t)
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
 	require.NoError(t, os.WriteFile(
 		filepath.Join(root, "sys", "bus", "pci", "devices", vgpuTestPCIBusID, "sriov_numvfs"),
@@ -324,7 +452,7 @@ func TestCreateVgpuDeviceVdevNoVFs(t *testing.T) {
 
 func TestCreateVgpuDeviceVdevParamsRejected(t *testing.T) {
 	root, _, _ := setupFakeVdevHost(t)
-	lib := vgpuTestDeviceLib(root)
+	lib := vgpuTestDeviceLib(t, root)
 
 	_, err := lib.createVgpuDevice(newVdevTestPartition(), map[string]string{"x": "y"})
 	require.ErrorContains(t, err, "not supported for the vdev framework")
@@ -333,7 +461,7 @@ func TestCreateVgpuDeviceVdevParamsRejected(t *testing.T) {
 func newVgpuLifecycleTestState(t *testing.T, sysfsRoot string) *DeviceState {
 	t.Helper()
 	state := newCleanupTestDeviceState(t, &Checkpoint{V2: &CheckpointV2{NodeBootID: "boot-vgpu-test"}})
-	state.nvdevlib = vgpuTestDeviceLib(sysfsRoot)
+	state.nvdevlib = vgpuTestDeviceLib(t, sysfsRoot)
 	state.config = &Config{flags: &Flags{kubeletPluginsDirectoryPath: t.TempDir()}}
 	return state
 }
@@ -465,13 +593,13 @@ func TestVgpuConcreteID(t *testing.T) {
 	mdev := &VgpuConcrete{Framework: vgpuFrameworkMdev, MdevUUID: "uuid-1"}
 	assert.Equal(t, "uuid-1", mdev.id())
 
-	vdev := &VgpuConcrete{Framework: vgpuFrameworkVdev, VFPCIBusID: "0000:41:01.0"}
+	vdev := &VgpuConcrete{Framework: vgpuFrameworkVf, VFPCIBusID: "0000:41:01.0"}
 	assert.Equal(t, "0000:41:01.0", vdev.id())
 }
 
 func TestVgpuMetadataAttributes(t *testing.T) {
 	partition := newMdevTestPartition()
-	concrete := &VgpuConcrete{Framework: vgpuFrameworkMdev, MdevUUID: "uuid-x", TypeID: vgpuTestTypeID, Profile: "NVIDIA L40S-12Q"}
+	concrete := &VgpuConcrete{Framework: vgpuFrameworkMdev, MdevUUID: "uuid-x", ProfileID: vgpuTestTypeID, Profile: "NVIDIA L40S-12Q"}
 
 	attrs := vgpuMetadataAttributes(partition, concrete)
 	require.Equal(t, "vgpu", *attrs["type"].StringValue)
@@ -479,7 +607,7 @@ func TestVgpuMetadataAttributes(t *testing.T) {
 	require.Equal(t, "uuid-x", *attrs["mdevUUID"].StringValue)
 	require.NotContains(t, attrs, "vfPCIBusID")
 
-	concrete = &VgpuConcrete{Framework: vgpuFrameworkVdev, VFPCIBusID: "0000:41:01.3"}
+	concrete = &VgpuConcrete{Framework: vgpuFrameworkVf, VFPCIBusID: "0000:41:01.3"}
 	attrs = vgpuMetadataAttributes(partition, concrete)
 	// KubeVirt expects `pciBusID` (the VF's address) for the vdev framework.
 	require.Equal(t, "0000:41:01.3", *attrs["pciBusID"].StringValue)
@@ -494,7 +622,7 @@ func TestPreparedVgpuCheckpointRoundtrip(t *testing.T) {
 			Vgpu: &PreparedVgpuDevice{
 				Concrete: &VgpuConcrete{
 					Framework:      vgpuFrameworkMdev,
-					TypeID:         vgpuTestTypeID,
+					ProfileID:      vgpuTestTypeID,
 					Profile:        "NVIDIA L40S-12Q",
 					ParentPCIBusID: vgpuTestPCIBusID,
 					MdevUUID:       "uuid-roundtrip",
@@ -526,5 +654,5 @@ func TestPreparedVgpuCheckpointRoundtrip(t *testing.T) {
 	vgpu := pc.PreparedDevices[1].Devices[0].Vgpu
 	require.NotNil(t, vgpu)
 	require.Equal(t, "uuid-roundtrip", vgpu.Concrete.MdevUUID)
-	require.Equal(t, uint32(vgpuTestTypeID), vgpu.Concrete.TypeID)
+	require.Equal(t, uint32(vgpuTestTypeID), vgpu.Concrete.ProfileID)
 }

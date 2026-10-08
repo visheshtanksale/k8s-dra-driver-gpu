@@ -19,13 +19,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/NVIDIA/go-nvlib/pkg/nvmdev"
+	"github.com/NVIDIA/go-nvlib/pkg/nvpci"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/klog/v2"
 
@@ -36,12 +41,12 @@ import (
 // Prepare time: either a mediated device (mdev UUID) or, for SR-IOV-backed
 // vGPU, a VF whose vGPU type was programmed. Serialized to the checkpoint.
 type VgpuConcrete struct {
-	// Framework is "mdev" or "vdev" (the vgpuFramework* constants).
+	// Framework is "mdev" or "vf" (the vgpuFramework* constants).
 	Framework string `json:"framework"`
-	// TypeID and Profile describe what was created (for diagnostics and for
+	// ProfileID and Profile describe what was created (for diagnostics and for
 	// validating checkpointed state against republished partitions).
-	TypeID  uint32 `json:"typeID"`
-	Profile string `json:"profile"`
+	ProfileID uint32 `json:"profileID"`
+	Profile   string `json:"profile"`
 
 	// ParentPCIBusID is the BDF of the physical GPU PF hosting this device.
 	ParentPCIBusID string `json:"parentPCIBusID"`
@@ -55,7 +60,7 @@ type VgpuConcrete struct {
 // id returns the stable host-level identifier of the concrete device, used
 // for ownership marker file names.
 func (c *VgpuConcrete) id() string {
-	if c.Framework == vgpuFrameworkVdev {
+	if c.Framework == vgpuFrameworkVf {
 		return c.VFPCIBusID
 	}
 	return c.MdevUUID
@@ -69,15 +74,55 @@ var vgpuWriteFile = os.WriteFile
 
 // vgpuMdevSysfsTypeName matches the NVIDIA vGPU Manager's mdev type naming
 // convention: mdev_supported_types directory entries are named
-// "nvidia-<typeID>".
-func vgpuMdevSysfsTypeName(typeID uint32) string {
-	return fmt.Sprintf("nvidia-%d", typeID)
+// "nvidia-<profileID>".
+func vgpuMdevSysfsTypeName(profileID uint32) string {
+	return fmt.Sprintf("nvidia-%d", profileID)
 }
 
 // sysfsPciDeviceDir returns the sysfs directory of the PCI device with the
 // given BDF, rooted at sysfsRoot (the host's sysfs).
 func sysfsPciDeviceDir(sysfsRoot string, bdf string) string {
 	return filepath.Join(sysfsRoot, "sys", "bus", "pci", "devices", bdf)
+}
+
+// vgpuMdevDevicesRoot is the kernel's canonical mdev instance directory
+// (same path nvmdev hardcodes in go-nvlib v0.12). Read directly from the
+// host sysfs view inside the privileged plugin container.
+const vgpuMdevDevicesRoot = "/sys/bus/mdev/devices"
+
+// nvidiaVgpuVfioModule is the kernel module of the NVIDIA vGPU mediated
+// device (vfio-mdev) driver. It is loaded by the NVIDIA vGPU Manager; an
+// mdev framework host without it cannot create vGPU instances, and failing
+// late (mdev type dir missing) is much harder to diagnose than failing here
+// (mirrors the PassthroughSupport module check in VfioPciManager.Configure).
+const nvidiaVgpuVfioModule = "nvidia_vgpu_vfio"
+
+// isVgpuVfioModuleLoaded checks whether nvidia_vgpu_vfio is loaded. It
+// checks the module's directory under /sys/module via the same convention as
+// checkKernelModuleLoaded (vfio-device.go), preferring the host root mount
+// and falling back to the plugin container's own sysfs view (shared with the
+// host).
+func (l deviceLib) isVgpuVfioModuleLoaded() (bool, error) {
+	for _, root := range []string{l.hostRoot, "/"} {
+		if root == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, sysModulePath)); errors.Is(err, fs.ErrNotExist) {
+			continue // this root does not carry a sysfs view
+		} else if err != nil {
+			return false, err
+		}
+		f, err := os.Stat(filepath.Join(root, sysModulePath, nvidiaVgpuVfioModule))
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return false, nil
+		case err != nil:
+			return false, fmt.Errorf("failed to check if module %q is loaded: %w", nvidiaVgpuVfioModule, err)
+		default:
+			return f.IsDir(), nil
+		}
+	}
+	return false, fmt.Errorf("cannot determine whether module %q is loaded (no /sys/module under %v)", nvidiaVgpuVfioModule, []string{l.hostRoot, "/"})
 }
 
 // sysfsMdevDeviceDir returns the sysfs directory of a potential mediated
@@ -87,10 +132,10 @@ func sysfsMdevDeviceDir(sysfsRoot string, devUUID string) string {
 }
 
 // Sysfs attribute names used by the NVIDIA vGPU Manager. Under the
-// mediated ("mdev") framework: mdev_supported_types/nvidia-<typeID>/{create,
+// mediated ("mdev") framework: mdev_supported_types/nvidia-<profileID>/{create,
 // available_instances} on the PF (legacy GPUs) or on a VF (SR-IOV GPUs), and
 // one instance dir per device under /sys/bus/mdev/devices/<uuid>. Under the
-// vendor-specific VFIO ("vdev") framework: per-VF attributes in
+// vendor-specific VFIO ("vf") framework: per-VF attributes in
 // <VF>/nvidia/{current_vgpu_type, creatable_vgpu_types}.
 const (
 	// vgpuCurrentTypeFile holds the vGPU type ID currently created on a VF;
@@ -110,7 +155,7 @@ const (
 func (l deviceLib) createVgpuDevice(partition *VgpuPartitionInfo, params map[string]string) (*VgpuConcrete, error) {
 	concrete := &VgpuConcrete{
 		Framework:      partition.Framework,
-		TypeID:         partition.Profile.TypeID,
+		ProfileID:      partition.Profile.ProfileID,
 		Profile:        partition.Profile.Name,
 		ParentPCIBusID: partition.Parent.pciBusID,
 	}
@@ -124,7 +169,7 @@ func (l deviceLib) createVgpuDevice(partition *VgpuPartitionInfo, params map[str
 	switch partition.Framework {
 	case vgpuFrameworkMdev:
 		err = l.createMdevVgpu(sysfsRoot, concrete, params)
-	case vgpuFrameworkVdev:
+	case vgpuFrameworkVf:
 		err = l.setVFVgpuType(sysfsRoot, concrete, params)
 	default:
 		err = fmt.Errorf("unknown vGPU framework %q", partition.Framework)
@@ -147,32 +192,160 @@ func (l deviceLib) deleteVgpuDevice(concrete *VgpuConcrete) error {
 
 	switch concrete.Framework {
 	case vgpuFrameworkMdev:
-		return l.deleteMdevVgpu(sysfsRoot, concrete)
-	case vgpuFrameworkVdev:
+		return l.deleteMdevVgpu(concrete)
+	case vgpuFrameworkVf:
 		return l.clearVFVgpuType(sysfsRoot, concrete)
 	}
 	return fmt.Errorf("unknown vGPU framework %q", concrete.Framework)
 }
 
-// createMdevVgpu creates a mediated device of the given vGPU type on the
-// parent physical GPU. On legacy (non-SR-IOV) GPUs the vGPU Manager exposes
-// mdev_supported_types on the PF; on SR-IOV GPUs using the mdev framework it
-// exposes them per VF, with at most one vGPU per VF. Creation is the single
-// write of a fresh UUID to the type's sysfs "create" file; params are then
-// applied to the instance's vgpu_params file when the vGPU Manager exposes
-// one.
-func (l deviceLib) createMdevVgpu(sysfsRoot string, concrete *VgpuConcrete, params map[string]string) error {
-	typeDir, vfBusID, err := l.findFreeMdevTypeDir(sysfsRoot, concrete)
+// vgpuMdevParent describes one candidate mdev parent: either the PF itself
+// (legacy GPUs) or one of its VFs (SR-IOV mdev hosts).
+type vgpuMdevParent struct {
+	// Address is the PCI bus ID of the parent device hosting the mdev type.
+	Address string
+	// AvailableInstances of the requested mdev type on this parent; zero
+	// means occupied/exhausted, negative means the parent does not advertise
+	// the type at all.
+	AvailableInstances int
+}
+
+// vgpuMdevStore abstracts the mediated-device host operations so the
+// nvmdev-backed implementation can be replaced in unit tests.
+type vgpuMdevStore interface {
+	// ParentsWithAvailability lists the PF and all its VFs that may host
+	// the given mdev type, with their current availability counts.
+	ParentsWithAvailability(pciBusID string, mdevType string) ([]vgpuMdevParent, error)
+	CreateMdev(parentAddress string, mdevType string, devUUID string) error
+	// DeleteMdev must be idempotent.
+	DeleteMdev(devUUID string) error
+}
+
+// nvmdevMdevStore is the production vgpuMdevStore implementation, delegating
+// the sysfs mechanics to NVIDIA's go-nvlib/pkg/nvmdev package (the same
+// library backing the NVIDIA vgpu-device-manager).
+type nvmdevMdevStore struct {
+	nvmdev nvmdev.Interface
+}
+
+func newNvmdevMdevStore(nvpci nvpci.Interface) *nvmdevMdevStore {
+	return &nvmdevMdevStore{nvmdev: nvmdev.New(nvmdev.WithNvpciLib(nvpci))}
+}
+
+func (s *nvmdevMdevStore) ParentsWithAvailability(pciBusID string, mdevType string) ([]vgpuMdevParent, error) {
+	parents, err := s.nvmdev.GetAllParentDevices()
+	if err != nil {
+		return nil, fmt.Errorf("error listing mdev parent devices: %w", err)
+	}
+
+	var out []vgpuMdevParent
+	for _, p := range parents {
+		pf := p.GetPhysicalFunction()
+		if pf == nil || pf.Address != pciBusID {
+			continue
+		}
+		avail, err := p.GetAvailableMDEVInstances(mdevType)
+		if err != nil {
+			return nil, fmt.Errorf("error getting available instances of %q on %q: %w", mdevType, p.Address, err)
+		}
+		out = append(out, vgpuMdevParent{Address: p.Address, AvailableInstances: avail})
+	}
+	return out, nil
+}
+
+func (s *nvmdevMdevStore) CreateMdev(parentAddress string, mdevType string, devUUID string) error {
+	parent, err := s.parentByAddress(parentAddress)
 	if err != nil {
 		return err
 	}
-	concrete.VFPCIBusID = vfBusID // empty for PF-hosted mdev
+	return parent.CreateMDEVDevice(mdevType, devUUID)
+}
+
+func (s *nvmdevMdevStore) DeleteMdev(devUUID string) error {
+	// nvmdev reads /sys/bus/mdev/devices; when no mdev subsystem exists on
+	// the host at all, deletion is trivially complete (idempotent).
+	if _, err := os.Stat(vgpuMdevDevicesRoot); os.IsNotExist(err) {
+		return nil
+	}
+	devices, err := s.nvmdev.GetAllDevices()
+	if err != nil {
+		return fmt.Errorf("error listing mdev devices: %w", err)
+	}
+	for _, d := range devices {
+		if d.UUID == devUUID {
+			return d.Delete()
+		}
+	}
+	klog.V(4).Infof("vGPU instance %s already gone; nothing to delete", devUUID)
+	return nil
+}
+
+func (s *nvmdevMdevStore) parentByAddress(address string) (*nvmdev.ParentDevice, error) {
+	parents, err := s.nvmdev.GetAllParentDevices()
+	if err != nil {
+		return nil, fmt.Errorf("error listing mdev parent devices: %w", err)
+	}
+	for _, p := range parents {
+		if p.Address == address {
+			return p, nil
+		}
+	}
+	return nil, fmt.Errorf("mdev parent device %q not found", address)
+}
+
+// createMdevVgpu creates a mediated device of the given vGPU type on the
+// parent physical GPU. On legacy (non-SR-IOV) GPUs the vGPU Manager exposes
+// mdev_supported_types on the PF; on SR-IOV GPUs using the mdev framework it
+// exposes them per VF, with at most one vGPU per VF. Params are applied to
+// the instance's vgpu_params file when the vGPU Manager exposes one.
+func (l deviceLib) createMdevVgpu(sysfsRoot string, concrete *VgpuConcrete, params map[string]string) error {
+	if l.vgpuMdev == nil {
+		return fmt.Errorf("mdev store not initialized")
+	}
+	// Fail fast with an actionable error when the host lacks the NVIDIA vGPU
+	// mediated-device driver; otherwise mdev creation would fail later with a
+	// bare "type not found".
+	if loaded, err := l.isVgpuVfioModuleLoaded(); err != nil {
+		return err
+	} else if !loaded {
+		return fmt.Errorf("kernel module %q is not loaded on this node; ensure the NVIDIA vGPU Manager is installed and its services are running", nvidiaVgpuVfioModule)
+	}
+	mdevType := vgpuMdevTypeName(concrete.Profile)
+
+	parents, err := l.vgpuMdev.ParentsWithAvailability(concrete.ParentPCIBusID, mdevType)
+	if err != nil {
+		return fmt.Errorf("error enumerating vGPU parents of GPU %q: %w", concrete.ParentPCIBusID, err)
+	}
+
+	// Prefer the PF (legacy GPUs); on SR-IOV mdev hosts a VF is free exactly
+	// when its single permitted instance is available.
+	var chosen *vgpuMdevParent
+	for i := range parents {
+		if parents[i].AvailableInstances <= 0 {
+			continue
+		}
+		switch {
+		case parents[i].Address == concrete.ParentPCIBusID:
+			chosen = &parents[i]
+		case chosen == nil && parents[i].AvailableInstances == 1:
+			chosen = &parents[i]
+		}
+		if chosen != nil && chosen.Address == concrete.ParentPCIBusID {
+			break
+		}
+	}
+	if chosen == nil {
+		return fmt.Errorf("vGPU type %q (%s) not found or busy on GPU %q and its VFs (vGPU Manager may not be running, the type may not be creatable, or all VFs are occupied)",
+			concrete.Profile, vgpuMdevSysfsTypeName(concrete.ProfileID), concrete.ParentPCIBusID)
+	}
+	if chosen.Address != concrete.ParentPCIBusID {
+		concrete.VFPCIBusID = chosen.Address
+	}
 
 	devUUID := uuid.New().String()
-	createPath := filepath.Join(typeDir, "create")
-	klog.V(4).Infof("Creating vGPU instance (type %q, mdev UUID %s) on GPU %q (type dir %s)",
-		concrete.Profile, devUUID, concrete.ParentPCIBusID, typeDir)
-	if err := vgpuWriteFile(createPath, []byte(devUUID), 0200); err != nil {
+	klog.V(4).Infof("Creating vGPU instance (type %q, mdev UUID %s) on parent %s (GPU %q)",
+		concrete.Profile, devUUID, chosen.Address, concrete.ParentPCIBusID)
+	if err := l.vgpuMdev.CreateMdev(chosen.Address, mdevType, devUUID); err != nil {
 		return fmt.Errorf("error creating vGPU instance of type %q on GPU %q: %w",
 			concrete.Profile, concrete.ParentPCIBusID, err)
 	}
@@ -186,7 +359,7 @@ func (l deviceLib) createMdevVgpu(sysfsRoot string, concrete *VgpuConcrete, para
 	if err := applyVgpuParams(deviceDir, params); err != nil {
 		// Roll back the just-created instance: a partition created with
 		// partial parameters must not escape Prepare.
-		if derr := l.deleteMdevVgpu(sysfsRoot, concrete); derr != nil {
+		if derr := l.deleteMdevVgpu(concrete); derr != nil {
 			klog.Warningf("failed to roll back vGPU instance %s after param application failure: %v", devUUID, derr)
 		}
 		return err
@@ -195,63 +368,17 @@ func (l deviceLib) createMdevVgpu(sysfsRoot string, concrete *VgpuConcrete, para
 	return nil
 }
 
-// findFreeMdevTypeDir locates the mdev_supported_types/<type> directory on
-// which to create the vGPU: the PF's directory for legacy GPUs, or a free
-// VF's directory for SR-IOV mdev hosts (a VF is free exactly when its type
-// dir reports one available instance, per the NVIDIA vGPU docs). Returns the
-// directory and, for VF-hosted mdev, the VF's PCI bus ID.
-func (l deviceLib) findFreeMdevTypeDir(sysfsRoot string, concrete *VgpuConcrete) (string, string, error) {
-	typeName := vgpuMdevSysfsTypeName(concrete.TypeID)
-	pfDir := sysfsPciDeviceDir(sysfsRoot, concrete.ParentPCIBusID)
-
-	pfTypeDir := filepath.Join(pfDir, "mdev_supported_types", typeName)
-	if avail, err := l.mdevAvailableInstances(pfTypeDir); err == nil {
-		if avail < 1 {
-			return "", "", fmt.Errorf("no available instances of vGPU type %q on GPU %q", concrete.Profile, concrete.ParentPCIBusID)
-		}
-		return pfTypeDir, "", nil
-	}
-
-	// Not on the PF: SR-IOV mdev. Find a VF whose type dir reports the type
-	// as creatable with its single allowed instance still available.
-	for _, vf := range vgpuVFsOfPF(pfDir) {
-		vfTypeDir := filepath.Join(sysfsPciDeviceDir(sysfsRoot, vf), "mdev_supported_types", typeName)
-		avail, err := l.mdevAvailableInstances(vfTypeDir)
-		if err != nil {
-			continue // this VF cannot host this type
-		}
-		if avail == 1 {
-			return vfTypeDir, vf, nil
-		}
-	}
-
-	return "", "", fmt.Errorf("vGPU type %q (%s) not found or busy on GPU %q and its VFs (vGPU Manager may not be running, the type may not be creatable, or all VFs are occupied)",
-		concrete.Profile, typeName, concrete.ParentPCIBusID)
-}
-
-// deleteMdevVgpu removes a mediated device instance. Writing "1" to the
-// instance's "remove" file is sufficient on all vGPU Manager versions.
-func (l deviceLib) deleteMdevVgpu(sysfsRoot string, concrete *VgpuConcrete) error {
+// deleteMdevVgpu removes a mediated device instance. Deletion is idempotent
+// (see nvmdevMdevStore.DeleteMdev), which is the correct outcome for retried
+// Unprepare calls.
+func (l deviceLib) deleteMdevVgpu(concrete *VgpuConcrete) error {
 	if concrete.MdevUUID == "" {
 		return fmt.Errorf("cannot delete mdev-based vGPU device: no mdev UUID recorded")
 	}
-	removePath := filepath.Join(sysfsMdevDeviceDir(sysfsRoot, concrete.MdevUUID), "remove")
-	if _, err := os.Lstat(removePath); err != nil {
-		if os.IsNotExist(err) {
-			klog.V(4).Infof("vGPU instance %s already gone; nothing to delete", concrete.MdevUUID)
-			return nil
-		}
-		return err
+	if l.vgpuMdev == nil {
+		return fmt.Errorf("mdev store not initialized")
 	}
-	return vgpuWriteFile(removePath, []byte("1"), 0200)
-}
-
-func (l deviceLib) mdevAvailableInstances(typeDir string) (int, error) {
-	data, err := os.ReadFile(filepath.Join(typeDir, "available_instances"))
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(strings.TrimSpace(string(data)))
+	return l.vgpuMdev.DeleteMdev(concrete.MdevUUID)
 }
 
 // applyVgpuParams writes parameters into the instance's vgpu_params sysfs
@@ -274,7 +401,7 @@ func applyVgpuParams(deviceDir string, params map[string]string) error {
 }
 
 // setVFVgpuType programs the given vGPU type onto a free VF of the parent
-// GPU's PF (vendor-specific VFIO, or "vdev", framework; NVIDIA vGPU Manager
+// GPU's PF (vendor-specific VFIO, or "vf", framework; NVIDIA vGPU Manager
 // on RHEL 10 KVM / Ubuntu 24.04+ hypervisors). Per the NVIDIA vGPU user
 // guide, a VF is free when its <VF>/nvidia/current_vgpu_type reads 0, the
 // requested type must appear in the VF's creatable_vgpu_types, and VFs must
@@ -322,20 +449,20 @@ func (l deviceLib) setVFVgpuType(sysfsRoot string, concrete *VgpuConcrete, param
 			continue
 		}
 
-		if err := vgpuWriteFile(typePath, []byte(fmt.Sprintf("%d", concrete.TypeID)), 0200); err != nil {
-			return fmt.Errorf("error setting vGPU type %d (%q) on VF %q: %w", concrete.TypeID, concrete.Profile, vf, err)
+		if err := vgpuWriteFile(typePath, []byte(fmt.Sprintf("%d", concrete.ProfileID)), 0200); err != nil {
+			return fmt.Errorf("error setting vGPU type %d (%q) on VF %q: %w", concrete.ProfileID, concrete.Profile, vf, err)
 		}
 		got, err := readTrimmed(typePath)
-		if err != nil || got != strconv.Itoa(int(concrete.TypeID)) {
-			return fmt.Errorf("verify failed: VF %q reports %s=%q after programming type %d (%q)", vf, vgpuCurrentTypeFile, got, concrete.TypeID, concrete.Profile)
+		if err != nil || got != strconv.Itoa(int(concrete.ProfileID)) {
+			return fmt.Errorf("verify failed: VF %q reports %s=%q after programming type %d (%q)", vf, vgpuCurrentTypeFile, got, concrete.ProfileID, concrete.Profile)
 		}
 
-		klog.V(4).Infof("Programmed vGPU type %q (id %d) on VF %s of GPU %q", concrete.Profile, concrete.TypeID, vf, concrete.ParentPCIBusID)
+		klog.V(4).Infof("Programmed vGPU type %q (id %d) on VF %s of GPU %q", concrete.Profile, concrete.ProfileID, vf, concrete.ParentPCIBusID)
 		concrete.VFPCIBusID = vf
 		return nil
 	}
 
-	return fmt.Errorf("no free VF with a creatable vGPU type %q (id %d) found on GPU %q", concrete.Profile, concrete.TypeID, concrete.ParentPCIBusID)
+	return fmt.Errorf("no free VF with a creatable vGPU type %q (id %d) found on GPU %q", concrete.Profile, concrete.ProfileID, concrete.ParentPCIBusID)
 }
 
 // vgpuTypeCreatableOnVF reads the VF's creatable_vgpu_types file and reports
@@ -357,7 +484,7 @@ func (l deviceLib) vgpuTypeCreatableOnVF(nvidiaDir string, concrete *VgpuConcret
 			continue
 		}
 		name := strings.Join(fields[:len(fields)-1], " ")
-		if uint32(id) == concrete.TypeID && name == concrete.Profile {
+		if uint32(id) == concrete.ProfileID && name == concrete.Profile {
 			return true, nil
 		}
 	}
