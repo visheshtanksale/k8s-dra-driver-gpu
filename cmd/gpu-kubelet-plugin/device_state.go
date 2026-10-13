@@ -335,7 +335,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	// concrete vGPU devices without ever committing them to the checkpoint;
 	// their marker files free them deterministically on this retry.
 	if featuregates.Enabled(featuregates.VGPUSupport) {
-		if err := s.cleanupVgpuDevicesForClaim(claimUID, claim.Status.Allocation); err != nil {
+		if err := s.cleanupVgpuMarkersForClaim(claimUID); err != nil {
 			return nil, fmt.Errorf("unable to clean up vGPU devices of a previous failed prepare for claim %v: %w", claimUID, err)
 		}
 	}
@@ -669,7 +669,7 @@ func (s *DeviceState) unpreparePartiallyPreparedClaim(ctx context.Context, cuid 
 	// Free concrete vGPU devices a partially-prepared claim may have created;
 	// the checkpoint does not know them, their marker files do.
 	if featuregates.Enabled(featuregates.VGPUSupport) {
-		if err := s.cleanupVgpuDevicesForClaim(cuid, pc.Status.Allocation); err != nil {
+		if err := s.cleanupVgpuMarkersForClaim(cuid); err != nil {
 			return fmt.Errorf("failed to clean up vGPU devices of partially prepared claim %s: %w", PreparedClaimToString(&pc, cuid), err)
 		}
 	}

@@ -147,69 +147,12 @@ const (
 	vgpuCreatableTypesFile = "creatable_vgpu_types"
 )
 
-// vgpuMdevNamespace is a private UUID namespace from which concrete mdev
-// UUIDs are derived (RFC 4122 UUIDv5, name-based SHA-1). Hard-coding the
-// namespace — a randomly generated, project-owned UUID — keeps derivations
-// project-unique while remaining stable across installs, so a live device
-// can always be attributed back to (claim UID, partition name) by hashing.
-var vgpuMdevNamespace = uuid.Must(uuid.Parse("9c6f5b2e-7d3a-4b8f-9e21-c5d4e6f7a802"))
-
-// vgpuMdevDeviceUUID deterministically derives the mdev UUID for a (claim,
-// partition) pair. Like Dynamic MIG's claim-computable naming
-// (gpu-<minor>-mig-<profile>-<profileID>-<placementStart>), this makes the
-// concrete device's identity reproducible from checkpoint data alone,
-// enabling enumeration-based orphan recovery without side-journal files:
-// for any checkpointed claim (PrepareStarted or PrepareCompleted) the
-// expected concrete UUIDs can be recomputed and reconciled against host
-// state. Claim UID reuse after pod/claim recreation produces a fresh UUID,
-// per-claim identity is unique.
-func vgpuMdevDeviceUUID(claimUID string, partitionName string) string {
-	return uuid.NewSHA1(vgpuMdevNamespace, []byte(claimUID+"/"+partitionName)).String()
-}
-
-// vgpuExpectedConcretes reconstructs the concrete vGPU devices a claim's
-// allocation can possibly have produced, without consulting any side
-// journal. For mdev partitions this is exact (the deterministic UUID is
-// computable from claim UID + partition name); for vf partitions the VF
-// chosen at prepare time is not derivable from claim data, so those remain
-// marked by the marker-file lifecycle instead. Returns nil for claims
-// without an allocation yet.
-func vgpuExpectedConcretes(claimUID string, allocation *resourceapi.AllocationResult, alloc *PerGPUAllocatableDevices) []*VgpuConcrete {
-	if allocation == nil {
-		return nil
-	}
-	var out []*VgpuConcrete
-	for _, r := range allocation.Devices.Results {
-		if r.Driver != DriverName {
-			continue
-		}
-		dev := alloc.GetAllocatableDevice(r.Device)
-		if dev == nil || dev.Type() != VgpuDeviceType {
-			continue
-		}
-		p := dev.Vgpu
-		c := &VgpuConcrete{
-			Framework:      p.Framework,
-			ProfileID:      p.Profile.ProfileID,
-			Profile:        p.Profile.Name,
-			ParentPCIBusID: p.Parent.pciBusID,
-		}
-		if c.Framework == vgpuFrameworkMdev {
-			c.MdevUUID = vgpuMdevDeviceUUID(claimUID, r.Device)
-		}
-		out = append(out, c)
-	}
-	return out
-}
-
 // createVgpuDevice creates the concrete vGPU device for an allocated
 // partition: an mdev instance under the mdev framework, or a programmed VF
-// under the vdev (SR-IOV) framework. The caller supplies the deterministic
-// mdev UUID for the mdev framework (see vgpuMdevDeviceUUID); it is ignored
-// for the vf framework. Returns the concrete identity for checkpointing.
-// Callers must serialize create/delete against Unprepare (the driver's
-// global prepare/unprepare lock guarantees this).
-func (l deviceLib) createVgpuDevice(partition *VgpuPartitionInfo, params map[string]string, devUUID string) (*VgpuConcrete, error) {
+// under the vdev (SR-IOV) framework. Returns the concrete identity for
+// checkpointing. Callers must serialize create/delete against Unprepare
+// (the driver's global prepare/unprepare lock guarantees this).
+func (l deviceLib) createVgpuDevice(partition *VgpuPartitionInfo, params map[string]string) (*VgpuConcrete, error) {
 	concrete := &VgpuConcrete{
 		Framework:      partition.Framework,
 		ProfileID:      partition.Profile.ProfileID,
@@ -225,7 +168,7 @@ func (l deviceLib) createVgpuDevice(partition *VgpuPartitionInfo, params map[str
 	var err error
 	switch partition.Framework {
 	case vgpuFrameworkMdev:
-		err = l.createMdevVgpu(sysfsRoot, concrete, devUUID, params)
+		err = l.createMdevVgpu(sysfsRoot, concrete, params)
 	case vgpuFrameworkVf:
 		err = l.setVFVgpuType(sysfsRoot, concrete, params)
 	default:
@@ -351,12 +294,11 @@ func (s *nvmdevMdevStore) parentByAddress(address string) (*nvmdev.ParentDevice,
 }
 
 // createMdevVgpu creates a mediated device of the given vGPU type on the
-// parent physical GPU with the caller-chosen (deterministic) UUID. On
-// legacy (non-SR-IOV) GPUs the vGPU Manager exposes mdev_supported_types on
-// the PF; on SR-IOV GPUs using the mdev framework it exposes them per VF,
-// with at most one vGPU per VF. Params are applied to the instance's
-// vgpu_params file when the vGPU Manager exposes one.
-func (l deviceLib) createMdevVgpu(sysfsRoot string, concrete *VgpuConcrete, devUUID string, params map[string]string) error {
+// parent physical GPU. On legacy (non-SR-IOV) GPUs the vGPU Manager exposes
+// mdev_supported_types on the PF; on SR-IOV GPUs using the mdev framework it
+// exposes them per VF, with at most one vGPU per VF. Params are applied to
+// the instance's vgpu_params file when the vGPU Manager exposes one.
+func (l deviceLib) createMdevVgpu(sysfsRoot string, concrete *VgpuConcrete, params map[string]string) error {
 	if l.vgpuMdev == nil {
 		return fmt.Errorf("mdev store not initialized")
 	}
@@ -400,6 +342,7 @@ func (l deviceLib) createMdevVgpu(sysfsRoot string, concrete *VgpuConcrete, devU
 		concrete.VFPCIBusID = chosen.Address
 	}
 
+	devUUID := uuid.New().String()
 	klog.V(4).Infof("Creating vGPU instance (type %q, mdev UUID %s) on parent %s (GPU %q)",
 		concrete.Profile, devUUID, chosen.Address, concrete.ParentPCIBusID)
 	if err := l.vgpuMdev.CreateMdev(chosen.Address, mdevType, devUUID); err != nil {
@@ -601,35 +544,25 @@ func readTrimmed(path string) (string, error) {
 }
 
 // prepareVgpuDevice creates the concrete vGPU device for an allocated
-// partition. mdev identity is deterministic (claim UID + partition name),
-// so no side journal is needed; the vf framework keeps the marker journal
-// because its VF selection is host-determined. Return values are
-// checkpointed by the caller.
+// partition and records it in the ownership-marker registry. Return values
+// are checkpointed by the caller.
 func (s *DeviceState) prepareVgpuDevice(claimUID string, partition *VgpuPartitionInfo, config *configapi.VgpuDeviceConfig) (*VgpuConcrete, error) {
 	var params map[string]string
 	if config != nil {
 		params = config.Params
 	}
 
-	devUUID := ""
-	if partition.Framework == vgpuFrameworkMdev {
-		devUUID = vgpuMdevDeviceUUID(claimUID, partition.CanonicalName())
-	}
-
-	concrete, err := s.nvdevlib.createVgpuDevice(partition, params, devUUID)
+	concrete, err := s.nvdevlib.createVgpuDevice(partition, params)
 	if err != nil {
 		return nil, err
 	}
-
-	if concrete.Framework == vgpuFrameworkVf {
-		if err := s.writeVgpuConcreteMarker(claimUID, concrete); err != nil {
-			// The device exists but would be untraceable across restarts;
-			// roll it back rather than leak it.
-			if derr := s.nvdevlib.deleteVgpuDevice(concrete); derr != nil {
-				klog.Warningf("failed to roll back vGPU device %s after marker write failure: %v", concrete.id(), derr)
-			}
-			return nil, fmt.Errorf("error recording vGPU device %q: %w", concrete.id(), err)
+	if err := s.writeVgpuConcreteMarker(claimUID, concrete); err != nil {
+		// The device exists but would be untraceable across restarts; roll
+		// it back rather than leak it.
+		if derr := s.nvdevlib.deleteVgpuDevice(concrete); derr != nil {
+			klog.Warningf("failed to roll back vGPU device %s after marker write failure: %v", concrete.id(), derr)
 		}
+		return nil, fmt.Errorf("error recording vGPU device %q: %w", concrete.id(), err)
 	}
 	return concrete, nil
 }
@@ -733,22 +666,11 @@ func (s *DeviceState) readVgpuConcreteMarkers() ([]*vgpuConcreteMarker, error) {
 	return markers, nil
 }
 
-// cleanupVgpuDevicesForClaim frees any concrete vGPU device the given claim
-// could have produced in a previous, failed Prepare attempt. mdev instances
-// are computable from the claim's allocation (deterministic UUIDs);
-// vendor-VFIO devices remain covered by the marker journal because the VF
-// chosen at prepare time is host-determined. Nothing else on the host is
+// cleanupVgpuMarkersForClaim deletes concrete vGPU devices recorded for the
+// given claim by a previous, failed Prepare attempt. Only devices created by
+// a previous attempt of THIS claim are freed; nothing else on the host is
 // touched.
-func (s *DeviceState) cleanupVgpuDevicesForClaim(claimUID string, allocation *resourceapi.AllocationResult) error {
-	for _, c := range vgpuExpectedConcretes(claimUID, allocation, s.perGPUAllocatable) {
-		if c.Framework != vgpuFrameworkMdev {
-			continue
-		}
-		if err := s.nvdevlib.deleteVgpuDevice(c); err != nil {
-			return fmt.Errorf("error deleting leftover vGPU device %s of claim %s: %w", c.id(), claimUID, err)
-		}
-	}
-
+func (s *DeviceState) cleanupVgpuMarkersForClaim(claimUID string) error {
 	markers, err := s.readVgpuConcreteMarkers()
 	if err != nil {
 		return err
@@ -767,15 +689,21 @@ func (s *DeviceState) cleanupVgpuDevicesForClaim(claimUID string, allocation *re
 	return nil
 }
 
-// DestroyOrphanVgpuDevices destroys concrete vGPU devices left behind by
-// crashed or failed Prepares. It runs once at startup, mirroring the MIG
-// orphan cleanup, but does it by recomputing identity from the checkpoint
-// rather than a side journal: every PrepareStarted claim's expected devices
-// (mdev via deterministic UUIDs; vf via marker files) are destroyed.
-// Completed claims are live state and kept; anything else (admin-created
-// devices unknown to the checkpoint) is deliberately never touched.
+// DestroyOrphanVgpuDevices destroys concrete vGPU devices that this driver
+// created (proven by a marker file) but that are not referenced by any
+// checkpointed claim in PrepareCompleted state. It runs once at startup,
+// mirroring the MIG orphan cleanup. Out-of-band (admin-created) mdevs have
+// no marker and are deliberately never touched.
 func (s *DeviceState) DestroyOrphanVgpuDevices(ctx context.Context) {
 	logpfx := "Destroy orphan vGPU devices"
+	markers, err := s.readVgpuConcreteMarkers()
+	if err != nil {
+		klog.Errorf("%s: unable to read markers: %s", logpfx, err)
+		return
+	}
+	if len(markers) == 0 {
+		return
+	}
 
 	cp, err := s.getCheckpoint(ctx)
 	if err != nil {
@@ -783,7 +711,7 @@ func (s *DeviceState) DestroyOrphanVgpuDevices(ctx context.Context) {
 		return
 	}
 
-	// Completed claims own concrete devices (mdev UUIDs and marked VFs).
+	// Collect concrete device IDs owned by completed claims.
 	alive := make(map[string]bool)
 	for _, claim := range cp.V2.PreparedClaims {
 		if claim.CheckpointState != ClaimCheckpointStatePrepareCompleted {
@@ -798,30 +726,6 @@ func (s *DeviceState) DestroyOrphanVgpuDevices(ctx context.Context) {
 		}
 	}
 
-	// mdev orphans of PrepareStarted claims: computable from their claims.
-	for claimUID, claim := range cp.V2.PreparedClaims {
-		if claim.CheckpointState != ClaimCheckpointStatePrepareStarted {
-			continue
-		}
-		uid := claimUID
-		c := claim
-		for _, concrete := range vgpuExpectedConcretes(uid, c.Status.Allocation, s.perGPUAllocatable) {
-			if concrete.Framework != vgpuFrameworkMdev || alive[concrete.id()] {
-				continue
-			}
-			klog.Infof("%s: destroying %s (claim %s, computed)", logpfx, concrete.id(), uid)
-			if err := s.nvdevlib.deleteVgpuDevice(concrete); err != nil {
-				klog.Errorf("%s: failed to delete %s: %s", logpfx, concrete.id(), err)
-			}
-		}
-	}
-
-	// vf orphans: marker journal, as before.
-	markers, err := s.readVgpuConcreteMarkers()
-	if err != nil {
-		klog.Errorf("%s: unable to read markers: %s", logpfx, err)
-		return
-	}
 	for _, m := range markers {
 		if alive[m.Concrete.id()] {
 			continue
