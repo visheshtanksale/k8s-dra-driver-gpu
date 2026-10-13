@@ -17,6 +17,8 @@ limitations under the License.
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
@@ -131,6 +133,9 @@ func TestVgpuPartitionGetDeviceAttributes(t *testing.T) {
 	require.Equal(t, gpu.UUID, *attrs["uuid"].StringValue)
 	require.Equal(t, gpu.productName, *attrs["productName"].StringValue)
 	require.Equal(t, vgpuFrameworkMdev, *attrs["vgpuFramework"].StringValue)
+	_, ok := attrs["sriovSupported"]
+	require.True(t, ok, "sriovSupported attribute must be published")
+	require.Equal(t, false, *attrs["sriovSupported"].BoolValue)
 	require.Equal(t, int64(1177), *attrs["profileID"].IntValue)
 }
 
@@ -287,25 +292,70 @@ func TestParseVgpuProfileAllowlist(t *testing.T) {
 }
 
 func TestDetectVgpuFramework(t *testing.T) {
-	t.Run("SR-IOV host vGPU mode means vf framework", func(t *testing.T) {
-		framework := detectVgpuFramework(func() (nvml.HostVgpuMode, nvml.Return) {
-			return nvml.HOST_VGPU_MODE_SRIOV, nvml.SUCCESS
-		})
-		assert.Equal(t, vgpuFrameworkVf, framework)
+	bdf := "0000:41:00.0"
+	sriovMode := func() (nvml.HostVgpuMode, nvml.Return) { return nvml.HOST_VGPU_MODE_SRIOV, nvml.SUCCESS }
+	nonSriovMode := func() (nvml.HostVgpuMode, nvml.Return) { return nvml.HOST_VGPU_MODE_NON_SRIOV, nvml.SUCCESS }
+	nvmlErr := func() (nvml.HostVgpuMode, nvml.Return) { return 0, nvml.ERROR_NOT_SUPPORTED }
+
+	t.Run("vendor VFIO attribute on a VF is definitive for vf", func(t *testing.T) {
+		root := t.TempDir()
+		devicesDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+		pfDir := filepath.Join(devicesDir, bdf)
+		require.NoError(t, os.MkdirAll(pfDir, 0o755))
+		vfDir := filepath.Join(devicesDir, "0000:41:01.0", "nvidia")
+		require.NoError(t, os.MkdirAll(vfDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(vfDir, vgpuCurrentTypeFile), []byte("0"), 0o644))
+		require.NoError(t, os.Symlink(filepath.Join(devicesDir, "0000:41:01.0"), filepath.Join(pfDir, "virtfn0")))
+
+		assert.Equal(t, vgpuFrameworkVf, detectVgpuFramework(sriovMode, root, bdf))
 	})
 
-	t.Run("non-SR-IOV host vGPU mode means mdev", func(t *testing.T) {
-		framework := detectVgpuFramework(func() (nvml.HostVgpuMode, nvml.Return) {
-			return nvml.HOST_VGPU_MODE_NON_SRIOV, nvml.SUCCESS
-		})
-		assert.Equal(t, vgpuFrameworkMdev, framework)
+	t.Run("mdev_supported_types on a VF means mdev (SR-IOV mdev host)", func(t *testing.T) {
+		root := t.TempDir()
+		devicesDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+		pfDir := filepath.Join(devicesDir, bdf)
+		require.NoError(t, os.MkdirAll(pfDir, 0o755))
+		vfDir := filepath.Join(devicesDir, "0000:41:01.4")
+		require.NoError(t, os.MkdirAll(filepath.Join(vfDir, "mdev_supported_types", "nvidia-468"), 0o755))
+		require.NoError(t, os.Symlink(vfDir, filepath.Join(pfDir, "virtfn0")))
+
+		assert.Equal(t, vgpuFrameworkMdev, detectVgpuFramework(sriovMode, root, bdf))
 	})
 
-	t.Run("NVML NOT_SUPPORTED falls back to mdev", func(t *testing.T) {
-		framework := detectVgpuFramework(func() (nvml.HostVgpuMode, nvml.Return) {
-			return 0, nvml.ERROR_NOT_SUPPORTED
-		})
-		assert.Equal(t, vgpuFrameworkMdev, framework)
+	t.Run("mdev_supported_types on PF means mdev (legacy host)", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "sys", "bus", "pci", "devices", bdf, "mdev_supported_types", "nvidia-1234"), 0o755))
+		assert.Equal(t, vgpuFrameworkMdev, detectVgpuFramework(nonSriovMode, root, bdf))
+	})
+
+	t.Run("no sysfs evidence: NVML SR-IOV mode hints vf", func(t *testing.T) {
+		assert.Equal(t, vgpuFrameworkVf, detectVgpuFramework(sriovMode, t.TempDir(), bdf))
+	})
+
+	t.Run("no sysfs evidence: NVML non-SR-IOV means mdev", func(t *testing.T) {
+		assert.Equal(t, vgpuFrameworkMdev, detectVgpuFramework(nonSriovMode, t.TempDir(), bdf))
+	})
+
+	t.Run("NVML error falls back to mdev", func(t *testing.T) {
+		assert.Equal(t, vgpuFrameworkMdev, detectVgpuFramework(nvmlErr, t.TempDir(), bdf))
+	})
+}
+
+func TestDetectSriovSupported(t *testing.T) {
+	bdf := "0000:41:00.0"
+
+	t.Run("sriov_totalvfs present", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "sys", "bus", "pci", "devices", bdf)
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "sriov_totalvfs"), []byte("32"), 0o600))
+		assert.True(t, detectSriovSupported(root, bdf))
+	})
+
+	t.Run("sriov_totalvfs absent", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "sys", "bus", "pci", "devices", bdf), 0o755))
+		assert.False(t, detectSriovSupported(root, bdf))
 	})
 }
 
