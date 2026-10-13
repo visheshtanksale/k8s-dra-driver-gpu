@@ -199,6 +199,8 @@ address; those are produced at Prepare time.
       string: pci0000:64            # inherited from the parent GPU
     slot:
       int: 2                        # slot index within this profile family (0..maxInstances-1)
+    sriovSupported:
+      bool: true                    # PF is SR-IOV capable (sriov_totalvfs present); capability bit, not mode
     type:
       string: vgpu                  # device kind
     profileID:

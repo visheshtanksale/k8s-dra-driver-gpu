@@ -18,6 +18,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -121,6 +122,13 @@ type VgpuPartitionInfo struct {
 	Slot int
 	// Framework is "mdev" or "vf" (vgpuFramework* constants).
 	Framework string
+	// SriovSupported reports whether the parent PCI function is SR-IOV
+	// capable at all (sriov_totalvfs present). Capability bit, not mode:
+	// it does not change when VFs are sliced off or vGPU types are
+	// programmed. It spans the GPU-capability axis of the NVIDIA vGPU
+	// mdev/vendor-VFIO table (legacy vs. SR-IOV rows), while Framework
+	// covers the active VFIO framework axis.
+	SriovSupported bool
 }
 
 func (i *VgpuPartitionInfo) CanonicalName() string {
@@ -154,6 +162,9 @@ func (i *VgpuPartitionInfo) Attributes() map[resourceapi.QualifiedName]resourcea
 		},
 		"vgpuFramework": {
 			StringValue: ptr.To(i.Framework),
+		},
+		"sriovSupported": {
+			BoolValue: ptr.To(i.SriovSupported),
 		},
 		"profileID": {
 			IntValue: ptr.To(int64(i.Profile.ProfileID)),
@@ -217,22 +228,53 @@ func parseVgpuProfileAllowlist(raw string) map[string]bool {
 	return allowed
 }
 
+// detectSriovSupported reports whether the physical function exposes
+// sriov_totalvfs (i.e. the GPU is SR-IOV capable), independent of whether
+// VFs are currently enabled.
+func detectSriovSupported(sysfsRoot string, pciBusID string) bool {
+	_, err := os.Stat(filepath.Join(sysfsPciDeviceDir(sysfsRoot, pciBusID), "sriov_totalvfs"))
+	return err == nil
+}
+
 // detectVgpuFramework determines whether the host manages vGPU devices
 // through the mediated framework ("mdev") or the vendor-specific VFIO
-// framework ("vf"), using NVML's device.GetHostVgpuMode
-// (nvmlHostVgpuMode_t): NVML_HOST_VGPU_MODE_SRIOV means the vGPU Manager
-// runs this GPU in SR-IOV mode, whose Prepare flow programs a VF's type via
-// the vendor VFIO attributes; otherwise the manager uses the mediated
-// framework. Calls pass in the NVML getter directly so detection is
-// testable without a full nvml.Device mock. Errors (device does not
-// support host vGPUs) fall back to "mdev", since framework is only
-// exercised at Prepare time.
-func detectVgpuFramework(getHostVgpuMode func() (nvml.HostVgpuMode, nvml.Return)) (framework string) {
-	mode, ret := getHostVgpuMode()
-	if ret != nvml.SUCCESS {
+// framework ("vf").
+//
+// The mdev/vf split is hypervisor-driven, not GPU-driven: on SR-IOV-capable
+// GPUs, the mediated framework (mdev_supported_types on the VFs, max one
+// vGPU per VF) is used on any hypervisor except the vendor-specific VFIO
+// flow (per-VF nvidia/current_vgpu_type etc.), which NVIDIA vGPU software
+// only exposes on RHEL 10 KVM / Ubuntu 24.04 and newer. So the framework is
+// detected by probing the actual attribute the Prepare path would write:
+//   - any VF with <VF>/nvidia/current_vgpu_type   → "vf"
+//   - <VF>/mdev_supported_types (SR-IOV mdev) or
+//     <PF>/mdev_supported_types (legacy)          → "mdev"
+//
+// When no VF exists yet (admin has not sliced the PF), sysfs probing is
+// inconclusive; fall back to NVML's nvmlDeviceGetHostVgpuMode as a hint:
+// SR-IOV host vGPU mode → "vf", otherwise "mdev".
+func detectVgpuFramework(getHostVgpuMode func() (nvml.HostVgpuMode, nvml.Return), sysfsRoot string, pciBusID string) (framework string) {
+	deviceDir := sysfsPciDeviceDir(sysfsRoot, pciBusID)
+
+	// Definitive: any enabled VF exposes the vendor-VFIO type attribute.
+	for _, vf := range vgpuVFsOfPF(deviceDir) {
+		if _, err := os.Stat(filepath.Join(vgpuVFNVidiaDir(sysfsRoot, vf), vgpuCurrentTypeFile)); err == nil {
+			return vgpuFrameworkVf
+		}
+	}
+	// Definitive: mediated devices advertised on the PF or a VF.
+	if entries, err := os.ReadDir(filepath.Join(deviceDir, "mdev_supported_types")); err == nil && len(entries) > 0 {
 		return vgpuFrameworkMdev
 	}
-	if mode == nvml.HOST_VGPU_MODE_SRIOV {
+	for _, vf := range vgpuVFsOfPF(deviceDir) {
+		if entries, err := os.ReadDir(filepath.Join(sysfsPciDeviceDir(sysfsRoot, vf), "mdev_supported_types")); err == nil && len(entries) > 0 {
+			return vgpuFrameworkMdev
+		}
+	}
+
+	// Inconclusive (no VFs yet): NVML hint.
+	mode, ret := getHostVgpuMode()
+	if ret == nvml.SUCCESS && mode == nvml.HOST_VGPU_MODE_SRIOV {
 		return vgpuFrameworkVf
 	}
 	return vgpuFrameworkMdev

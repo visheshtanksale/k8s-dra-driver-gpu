@@ -453,10 +453,12 @@ func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (Al
 		return nil, fmt.Errorf("error getting creatable vGPU types for GPU %q: %w", gpuInfo.CanonicalName(), ret)
 	}
 	klog.Infof("VISHESH: Creatable vGPU types: %v", types)
-	// Detect the host's vGPU framework from NVML
-	// (nvmlDeviceGetHostVgpuMode), not sysfs: SR-IOV mode implies the
-	// vendor-specific VFIO path ("vf"), otherwise mdev.
-	framework := detectVgpuFramework(d.GetHostVgpuMode)
+	sysfsRoot := l.sysfsRoot
+	if sysfsRoot == "" {
+		sysfsRoot = "/"
+	}
+	framework := detectVgpuFramework(d.GetHostVgpuMode, sysfsRoot, gpuInfo.pciBusID)
+	sriovSupported := detectSriovSupported(sysfsRoot, gpuInfo.pciBusID)
 
 	var profiles []*VgpuProfileSpec
 	for _, profileID := range types {
@@ -506,10 +508,11 @@ func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (Al
 		for slot := 0; slot < spec.MaxInstances; slot++ {
 			dev := &AllocatableDevice{
 				Vgpu: &VgpuPartitionInfo{
-					Parent:    gpuInfo,
-					Profile:   spec,
-					Slot:      slot,
-					Framework: framework,
+					Parent:         gpuInfo,
+					Profile:        spec,
+					Slot:           slot,
+					Framework:      framework,
+					SriovSupported: sriovSupported,
 				},
 			}
 			allocatable[dev.Vgpu.CanonicalName()] = dev
