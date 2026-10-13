@@ -24,7 +24,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
@@ -172,17 +171,13 @@ func (s *fakeSysfsMdevStore) DeleteMdev(devUUID string) error {
 	return vgpuWriteFile(removePath, []byte("1"), 0200)
 }
 
-// The deterministic UUID for test fixtures: derived from claim UID +
-// partition canonical name, exactly like prepareVgpuDevice computes it.
-var testDevUUID = vgpuMdevDeviceUUID("claim-test", "vgpu-gpu-0-12q-0")
-
 func TestCreateVgpuDeviceMdev(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
 	lib := vgpuTestDeviceLib(t, root)
 
 	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), map[string]string{
 		"frame_rate_limiter": "0",
-	}, testDevUUID)
+	})
 	require.NoError(t, err)
 
 	if assert.NotNil(t, concrete) {
@@ -190,8 +185,7 @@ func TestCreateVgpuDeviceMdev(t *testing.T) {
 		assert.Equal(t, uint32(vgpuTestTypeID), concrete.ProfileID)
 		assert.Equal(t, "NVIDIA L40S-12Q", concrete.Profile)
 		assert.Equal(t, vgpuTestPCIBusID, concrete.ParentPCIBusID)
-		// The caller-chosen deterministic UUID must be used verbatim.
-		assert.Equal(t, testDevUUID, concrete.MdevUUID)
+		assert.NotEmpty(t, concrete.MdevUUID)
 	}
 
 	// The mdev instance exists on the host, including its removable handle.
@@ -233,7 +227,7 @@ func TestCreateVgpuDeviceMdevOnFreeVF(t *testing.T) {
 	vgpuWriteFile = fakeMdevKernelWrites(root, nil)
 
 	lib := vgpuTestDeviceLib(t, root)
-	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), nil, testDevUUID)
+	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
 	require.NoError(t, err)
 
 	// Created on the free VF, recording both identities.
@@ -291,7 +285,7 @@ func TestCreateVgpuDeviceMdevModuleMissing(t *testing.T) {
 	hostRoot := lib.hostRoot
 	require.NoError(t, os.RemoveAll(filepath.Join(hostRoot, "sys", "module", nvidiaVgpuVfioModule)))
 
-	_, err := lib.createVgpuDevice(newMdevTestPartition(), nil, testDevUUID)
+	_, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
 	require.ErrorContains(t, err, nvidiaVgpuVfioModule+"\" is not loaded")
 }
 
@@ -318,7 +312,7 @@ func TestCreateVgpuDeviceMdevNoInstances(t *testing.T) {
 	root := setupFakeMdevHost(t, "0")
 	lib := vgpuTestDeviceLib(t, root)
 
-	_, err := lib.createVgpuDevice(newMdevTestPartition(), nil, testDevUUID)
+	_, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
 	require.ErrorContains(t, err, "not found or busy on GPU")
 }
 
@@ -331,7 +325,7 @@ func TestCreateVgpuDeviceMdevUnknownType(t *testing.T) {
 	partition := newMdevTestPartition()
 	partition.Profile.Name = "NVIDIA L40S-24Q"
 
-	_, err := lib.createVgpuDevice(partition, nil, testDevUUID)
+	_, err := lib.createVgpuDevice(partition, nil)
 	require.ErrorContains(t, err, "not found or busy on GPU")
 }
 
@@ -339,7 +333,7 @@ func TestDeleteVgpuDeviceMdev(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
 	lib := vgpuTestDeviceLib(t, root)
 
-	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), nil, testDevUUID)
+	concrete, err := lib.createVgpuDevice(newMdevTestPartition(), nil)
 	require.NoError(t, err)
 
 	require.NoError(t, lib.deleteVgpuDevice(concrete))
@@ -394,7 +388,7 @@ func TestCreateVgpuDeviceVdev(t *testing.T) {
 	root, freeVF, busyVF := setupFakeVdevHost(t)
 	lib := vgpuTestDeviceLib(t, root)
 
-	concrete, err := lib.createVgpuDevice(newVdevTestPartition(), nil, "")
+	concrete, err := lib.createVgpuDevice(newVdevTestPartition(), nil)
 	require.NoError(t, err)
 
 	// The busy VF must have been skipped, the free one programmed.
@@ -419,7 +413,7 @@ func TestCreateVgpuDeviceVdevUncreatableType(t *testing.T) {
 	partition := newVdevTestPartition()
 	partition.Profile.ProfileID = 9999
 
-	_, err := lib.createVgpuDevice(partition, nil, testDevUUID)
+	_, err := lib.createVgpuDevice(partition, nil)
 	require.ErrorContains(t, err, "no free VF")
 
 	current, err := os.ReadFile(filepath.Join(root, "sys", "bus", "pci", "devices", freeVF, "nvidia", vgpuCurrentTypeFile))
@@ -431,7 +425,7 @@ func TestDeleteVgpuDeviceVdev(t *testing.T) {
 	root, _, _ := setupFakeVdevHost(t)
 	lib := vgpuTestDeviceLib(t, root)
 
-	concrete, err := lib.createVgpuDevice(newVdevTestPartition(), nil, "")
+	concrete, err := lib.createVgpuDevice(newVdevTestPartition(), nil)
 	require.NoError(t, err)
 
 	require.NoError(t, lib.deleteVgpuDevice(concrete))
@@ -452,7 +446,7 @@ func TestCreateVgpuDeviceVdevNoVFs(t *testing.T) {
 		filepath.Join(root, "sys", "bus", "pci", "devices", vgpuTestPCIBusID, "sriov_numvfs"),
 		[]byte("0"), 0644))
 
-	_, err := lib.createVgpuDevice(newVdevTestPartition(), nil, "")
+	_, err := lib.createVgpuDevice(newVdevTestPartition(), nil)
 	require.ErrorContains(t, err, "no SR-IOV VFs enabled")
 }
 
@@ -460,7 +454,7 @@ func TestCreateVgpuDeviceVdevParamsRejected(t *testing.T) {
 	root, _, _ := setupFakeVdevHost(t)
 	lib := vgpuTestDeviceLib(t, root)
 
-	_, err := lib.createVgpuDevice(newVdevTestPartition(), map[string]string{"x": "y"}, "")
+	_, err := lib.createVgpuDevice(newVdevTestPartition(), map[string]string{"x": "y"})
 	require.ErrorContains(t, err, "not supported for the vdev framework")
 }
 
@@ -472,17 +466,15 @@ func newVgpuLifecycleTestState(t *testing.T, sysfsRoot string) *DeviceState {
 	return state
 }
 
-func TestPrepareUnprepareVgpuDeviceMdevDeterministic(t *testing.T) {
+func TestPrepareUnprepareVgpuDeviceMarkers(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
 	state := newVgpuLifecycleTestState(t, root)
-	partition := newMdevTestPartition()
 
-	concrete, err := state.prepareVgpuDevice("claim-1", partition, nil)
+	concrete, err := state.prepareVgpuDevice("claim-1", newMdevTestPartition(), nil)
 	require.NoError(t, err)
 
-	// Identity is claim-derived and marker-free for the mdev framework.
-	require.Equal(t, vgpuMdevDeviceUUID("claim-1", partition.CanonicalName()), concrete.MdevUUID)
-	require.NoFileExists(t, filepath.Join(state.config.DriverPluginPath(), "vgpu-concrete", concrete.id()))
+	// Ownership marker exists alongside the device.
+	require.FileExists(t, filepath.Join(state.config.DriverPluginPath(), "vgpu-concrete", concrete.id()))
 
 	devices := PreparedDeviceList{{
 		Vgpu: &PreparedVgpuDevice{
@@ -491,73 +483,45 @@ func TestPrepareUnprepareVgpuDeviceMdevDeterministic(t *testing.T) {
 		},
 	}}
 	require.NoError(t, state.unprepareVgpuDevices(devices))
+
 	require.NoDirExists(t, filepath.Join(root, "sys", "bus", "mdev", "devices", concrete.MdevUUID))
+	require.NoFileExists(t, filepath.Join(state.config.DriverPluginPath(), "vgpu-concrete", concrete.id()))
 }
 
-func TestCleanupVgpuDevicesForClaim(t *testing.T) {
+func TestCleanupVgpuMarkersForClaim(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
 	state := newVgpuLifecycleTestState(t, root)
 
-	partition := newMdevTestPartition()
-	state.perGPUAllocatable = &PerGPUAllocatableDevices{allocatablesMap: map[PCIBusID]AllocatableDevices{
-		vgpuTestPCIBusID: {partition.CanonicalName(): {Vgpu: partition}},
-	}}
-
-	concrete1, err := state.prepareVgpuDevice("claim-1", partition, nil)
+	// Two claims each created a concrete device; the second claim's prepare
+	// failed before the checkpoint commit.
+	concrete1, err := state.prepareVgpuDevice("claim-1", newMdevTestPartition(), nil)
 	require.NoError(t, err)
-	concrete2, err := state.prepareVgpuDevice("claim-2", partition, nil)
+	concrete2, err := state.prepareVgpuDevice("claim-2", newMdevTestPartition(), nil)
 	require.NoError(t, err)
-	// Distinct claim UIDs → distinct deterministic UUIDs, so both exist.
-	require.NotEqual(t, concrete1.MdevUUID, concrete2.MdevUUID)
 
-	allocation := &resourceapi.AllocationResult{
-		Devices: resourceapi.DeviceAllocationResult{
-			Results: []resourceapi.DeviceRequestAllocationResult{{
-				Driver: DriverName, Pool: "pool", Device: partition.CanonicalName(), Request: "r",
-			}},
-		},
-	}
-	require.NoError(t, state.cleanupVgpuDevicesForClaim("claim-2", allocation))
+	require.NoError(t, state.cleanupVgpuMarkersForClaim("claim-2"))
 
 	// Only claim-2's device was destroyed.
 	require.NoDirExists(t, filepath.Join(root, "sys", "bus", "mdev", "devices", concrete2.MdevUUID))
 	require.DirExists(t, filepath.Join(root, "sys", "bus", "mdev", "devices", concrete1.MdevUUID))
+	require.FileExists(t, filepath.Join(state.config.DriverPluginPath(), "vgpu-concrete", concrete1.id()))
 }
 
 func TestDestroyOrphanVgpuDevices(t *testing.T) {
 	root := setupFakeMdevHost(t, "4")
 	state := newVgpuLifecycleTestState(t, root)
 
-	partition := newMdevTestPartition()
-	state.perGPUAllocatable = &PerGPUAllocatableDevices{allocatablesMap: map[PCIBusID]AllocatableDevices{
-		vgpuTestPCIBusID: {partition.CanonicalName(): {Vgpu: partition}},
-	}}
-
-	orphan, err := state.prepareVgpuDevice("claim-orphan", partition, nil)
+	orphan, err := state.prepareVgpuDevice("claim-orphan", newMdevTestPartition(), nil)
 	require.NoError(t, err)
-	alive, err := state.prepareVgpuDevice("claim-alive", partition, nil)
+	alive, err := state.prepareVgpuDevice("claim-alive", newMdevTestPartition(), nil)
 	require.NoError(t, err)
 
 	_, ctx := ktesting.NewTestContext(t)
 
-	// claim-orphan is checkpointed as PrepareStarted (failed prepare, claim
-	// leaked a device the checkpoint cannot name).
-	// claim-alive is checkpointed as fully prepared.
+	// Only claim-alive is checkpointed as fully prepared.
 	require.NoError(t, state.updateCheckpoint(ctx, func(cp *Checkpoint) {
 		if cp.V2.PreparedClaims == nil {
 			cp.V2.PreparedClaims = PreparedClaimsByUID{}
-		}
-		cp.V2.PreparedClaims["claim-orphan"] = PreparedClaimV2{
-			CheckpointState: ClaimCheckpointStatePrepareStarted,
-			Status: resourceapi.ResourceClaimStatus{
-				Allocation: &resourceapi.AllocationResult{
-					Devices: resourceapi.DeviceAllocationResult{
-						Results: []resourceapi.DeviceRequestAllocationResult{{
-							Driver: DriverName, Pool: "pool", Device: partition.CanonicalName(), Request: "r",
-						}},
-					},
-				},
-			},
 		}
 		cp.V2.PreparedClaims["claim-alive"] = PreparedClaim{
 			CheckpointState: ClaimCheckpointStatePrepareCompleted,
@@ -623,40 +587,6 @@ func TestPrepareVgpuDeviceClaimWithoutConfig(t *testing.T) {
 	require.NotNil(t, preparedGroupVgpu)
 	require.NotEmpty(t, preparedGroupVgpu.Concrete.MdevUUID)
 	require.DirExists(t, filepath.Join(root, "sys", "bus", "mdev", "devices", preparedGroupVgpu.Concrete.MdevUUID))
-}
-
-func TestVgpuMdevDeviceUUID(t *testing.T) {
-	a := vgpuMdevDeviceUUID("claim-1", "vgpu-gpu-0-12q-0")
-
-	// Stable across recomputation — the root property recovery relies on.
-	require.Equal(t, a, vgpuMdevDeviceUUID("claim-1", "vgpu-gpu-0-12q-0"))
-	// Valid RFC 4122 UUID, version 5 variant (SHA-1 name-based).
-	parsed, err := uuid.Parse(a)
-	require.NoError(t, err)
-	require.EqualValues(t, 5, int(parsed.Version()))
-	// Different claim or different partition changes the identity.
-	require.NotEqual(t, a, vgpuMdevDeviceUUID("claim-2", "vgpu-gpu-0-12q-0"))
-	require.NotEqual(t, a, vgpuMdevDeviceUUID("claim-1", "vgpu-gpu-0-12q-1"))
-}
-
-func TestVgpuExpectedConcretes(t *testing.T) {
-	partition := newMdevTestPartition()
-	alloc := &PerGPUAllocatableDevices{allocatablesMap: map[PCIBusID]AllocatableDevices{
-		vgpuTestPCIBusID: {partition.CanonicalName(): {Vgpu: partition}},
-	}}
-	allocation := &resourceapi.AllocationResult{
-		Devices: resourceapi.DeviceAllocationResult{
-			Results: []resourceapi.DeviceRequestAllocationResult{{
-				Driver: DriverName, Pool: "pool", Device: partition.CanonicalName(), Request: "r",
-			}},
-		},
-	}
-
-	concretes := vgpuExpectedConcretes("claim-x", allocation, alloc)
-	require.Len(t, concretes, 1)
-	require.Equal(t, vgpuMdevDeviceUUID("claim-x", partition.CanonicalName()), concretes[0].MdevUUID)
-	require.Equal(t, "NVIDIA L40S-12Q", concretes[0].Profile)
-	require.Nil(t, vgpuExpectedConcretes("claim-x", nil, alloc))
 }
 
 func TestVgpuConcreteID(t *testing.T) {
