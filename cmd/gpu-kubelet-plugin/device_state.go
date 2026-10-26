@@ -159,8 +159,8 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		WithCDIRoot(config.flags.cdiRoot),
 		WithLogger(cdilogger),
 	}
-	if (featuregates.Enabled(featuregates.PassthroughSupport) && nvdevlib.IsVfioEnabled()) 
-	|| featuregates.Enabled(featuregates.VGPUSupport) {
+	if (featuregates.Enabled(featuregates.PassthroughSupport) && nvdevlib.IsVfioEnabled()) ||
+		featuregates.Enabled(featuregates.VGPUSupport) {
 		vfioCDIHandler, err := NewVfioCDIHandler(nvdevlib)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create vfio CDI handler: %w", err)
@@ -377,7 +377,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	// With VGPUSupport the partitionable publish path replaces sibling
 	// removal: exclusivity between vfio/gpu and vgpu partitions is provided by
 	// the shared CounterSet (full consumption) plus compatibility groups.
-	if (featuregates.Enabled(featuregates.PassthroughSupport) && s.nvdevlib.IsVfioEnabled())  && !featuregates.Enabled(featuregates.VGPUSupport) {
+	if (featuregates.Enabled(featuregates.PassthroughSupport) && s.nvdevlib.IsVfioEnabled()) && !featuregates.Enabled(featuregates.VGPUSupport) {
 		for _, device := range preparedDevices.GetDevices() {
 			allocatableDevice := s.perGPUAllocatable.GetAllocatableDevice(device.DeviceName)
 			if allocatableDevice == nil {
@@ -543,7 +543,7 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimRef kubeletplugin.Name
 
 	// TODO: Remove this once partitionable device support is introduced for vfio devices.
 	// See Prepare: sibling rediscovery only applies to the legacy publish path.
-	if (featuregates.Enabled(featuregates.PassthroughSupport) && s.nvdevlib.IsVfioEnabled())  && !featuregates.Enabled(featuregates.VGPUSupport) {
+	if (featuregates.Enabled(featuregates.PassthroughSupport) && s.nvdevlib.IsVfioEnabled()) && !featuregates.Enabled(featuregates.VGPUSupport) {
 		for _, device := range pc.PreparedDevices.GetDevices() {
 			allocatableDevice := s.perGPUAllocatable.GetAllocatableDevice(device.DeviceName)
 			if allocatableDevice == nil {

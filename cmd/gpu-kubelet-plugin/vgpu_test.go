@@ -137,6 +137,15 @@ func TestVgpuPartitionGetDeviceAttributes(t *testing.T) {
 	require.True(t, ok, "sriovSupported attribute must be published")
 	require.Equal(t, false, *attrs["sriovSupported"].BoolValue)
 	require.Equal(t, int64(1177), *attrs["profileID"].IntValue)
+
+	// ECC state unknown (nil) → omitted, never misleading.
+	_, hasEcc := attrs["eccMode"]
+	require.False(t, hasEcc)
+
+	partition.EccMode = ptr.To(true)
+
+	attrs = partition.PartGetDevice().Attributes
+	require.Equal(t, true, *attrs["eccMode"].BoolValue)
 }
 
 func TestVgpuPartitionConsumesCounters(t *testing.T) {

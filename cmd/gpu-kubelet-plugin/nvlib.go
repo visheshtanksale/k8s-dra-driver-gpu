@@ -35,6 +35,7 @@ import (
 	"github.com/NVIDIA/go-nvlib/pkg/nvpci"
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/lookup/root"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
@@ -69,7 +70,7 @@ type deviceLib struct {
 	vgpuMdev vgpuMdevStore
 }
 
-func newDeviceLib(driver *root.Driver, hostRoot string) (*deviceLib, error) {
+func newDeviceLib(driver *root.Driver, hostRoot string, vgpuProfiles string) (*deviceLib, error) {
 	vfioEnabled := false
 	if featuregates.Enabled(featuregates.PassthroughSupport) {
 		var err error
@@ -460,6 +461,17 @@ func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (Al
 	framework := detectVgpuFramework(d.GetHostVgpuMode, sysfsRoot, gpuInfo.pciBusID)
 	sriovSupported := detectSriovSupported(sysfsRoot, gpuInfo.pciBusID)
 
+	// Parent-GPU ECC state; omitted from advertised attributes entirely when
+	// NVML cannot report it (never published as a misleading false).
+	var eccMode *bool
+	current, _, ret := d.GetEccMode()
+	switch ret {
+	case nvml.SUCCESS:
+		eccMode = ptr.To(current == nvml.FEATURE_ENABLED)
+	default:
+		klog.V(4).Infof("GPU %s does not report ECC mode (%v); omitting eccMode attributes from vGPU partitions", gpuInfo.CanonicalName(), ret)
+	}
+
 	var profiles []*VgpuProfileSpec
 	for _, profileID := range types {
 		name, ret := profileID.GetName()
@@ -513,6 +525,7 @@ func (l deviceLib) enumerateVgpuPartitions(gpuInfo *GpuInfo, d nvdev.Device) (Al
 					Slot:           slot,
 					Framework:      framework,
 					SriovSupported: sriovSupported,
+					EccMode:        eccMode,
 				},
 			}
 			allocatable[dev.Vgpu.CanonicalName()] = dev

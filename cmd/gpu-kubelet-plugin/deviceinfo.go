@@ -66,11 +66,11 @@ type GpuInfo struct {
 	// `partition4`/`partition8` device attributes.
 	partitionsBySize map[int]int
 
-	 // vgp profiles advertised for this physical GPU with the VGPUSupport
-        // feature gate: the intersection of host-supported vGPU types and the
-        // admin allowlist. Non-nil only for non-MIG GPUs with at least one
-        // allowlisted, host-supported vGPU profile (see enumerateVgpuPartitions).
-        vgpuProfiles []*VgpuProfileSpe
+	// vgp profiles advertised for this physical GPU with the VGPUSupport
+	// feature gate: the intersection of host-supported vGPU types and the
+	// admin allowlist. Non-nil only for non-MIG GPUs with at least one
+	// allowlisted, host-supported vGPU profile (see enumerateVgpuPartitions).
+	vgpuProfiles []*VgpuProfileSpec
 }
 
 // Represents a specific (concrete, incarnated, created) MIG device. Annotated

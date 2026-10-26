@@ -271,6 +271,7 @@ Required attributes (bare keys in slice; CEL via `gpu.nvidia.com`):
 | `resource.kubernetes.io/pciBusID` | PF BDF |
 | `vgpuFramework` | `mdev` \| `vf` |
 | `sriovSupported` | bool; PF SR-IOV capability (`sriov_totalvfs`) |
+| `eccMode` | bool; parent GPU ECC state from NVML; omitted when NVML cannot report |
 | `profileID` | int (optional attr if useful for CEL; also in config) |
 
 MIG-backed extras: `migProfile`, `placementStart`, `placementSize`, `gpuProfileId`, `computeProfileId`.

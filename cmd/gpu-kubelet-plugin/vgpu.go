@@ -129,6 +129,12 @@ type VgpuPartitionInfo struct {
 	// mdev/vendor-VFIO table (legacy vs. SR-IOV rows), while Framework
 	// covers the active VFIO framework axis.
 	SriovSupported bool
+
+	// EccMode mirrors the parent GPU's current ECC state from NVML
+	// (DeviceGetEccMode). A nil pointer means NVML could not report it —
+	// the attribute is then omitted rather than published as a misleading
+	// false.
+	EccMode *bool
 }
 
 func (i *VgpuPartitionInfo) CanonicalName() string {
@@ -169,6 +175,10 @@ func (i *VgpuPartitionInfo) Attributes() map[resourceapi.QualifiedName]resourcea
 		"profileID": {
 			IntValue: ptr.To(int64(i.Profile.ProfileID)),
 		},
+	}
+
+	if i.EccMode != nil {
+		attrs["eccMode"] = resourceapi.DeviceAttribute{BoolValue: i.EccMode}
 	}
 
 	addDeviceAttribute(attrs, i.Parent.pciBusIDAttr)
